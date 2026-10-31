@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartOPD · Nurse Desk</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Smart<span>OPD</span>
+    <small>CV queue &amp; wait-time system · nurse desk</small></div>
+  <nav class="roles">
+    <a href="/">① Monitor</a>
+    <a class="on" href="/nurse">② Nurse desk</a>
+    <a href="/patient">③ Patient display</a>
+  </nav>
+  <div class="clockbox">Clinic clock <b id="clk">--:--</b>
+    <span class="badge" id="connBadge">live</span></div>
+</header>
+
+<main>
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>Register patient &amp; issue token</h2>
+      <div class="row" style="margin-top:0">
+        <input type="text" id="pn" placeholder="Patient name" style="flex:1;min-width:170px">
+        <select id="pt">
+          <option>New visit</option><option>Follow-up</option>
+        </select>
+        <label><input type="checkbox" id="pp2"> Priority ⚑</label>
+        <button id="issueBtn">Issue token</button>
+      </div>
+      <div class="row">
+        <button class="s" id="seedBtn">Add 5 demo patients</button>
+        <label><input type="checkbox" id="say" checked> announce calls aloud</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live queue</h2>
+      <div class="row" style="margin:0 0 10px">
+        <button class="g" id="callBtn">Call next patient</button>
+        <label style="margin-left:6px"><input type="checkbox" id="autoAdv"> camera advances queue</label>
+        <span class="hint" id="roomHint"></span>
+      </div>
+      <div class="hint" id="modeHint" style="margin:-2px 0 10px"></div>
+      <table>
+        <thead><tr><th>Token</th><th>Patient</th><th>Type</th><th>Status</th>
+          <th>Wait estimate</th><th>Actions</th></tr></thead>
+        <tbody id="qb"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Today</h2>
+      <span class="stat"><b id="sServed">0</b><small>served</small></span>
+      <span class="stat"><b id="sWait">0</b><small>waiting</small></span>
+      <span class="stat"><b id="sAvg">8</b><small>min / patient</small></span>
+      <span class="stat"><b id="sLearn">0</b><small>learned from</small></span>
+    </div>
+
+    <div class="card">
+      <h2>Doctor room</h2>
+      <div id="roomSt" class="hint">—</div>
+      <div class="row">
+        <button class="s" id="mIn">Mark entered</button>
+        <button class="s" id="mOut">Mark free</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Completed consultations</h2>
+      <table>
+        <thead><tr><th>Token</th><th>Patient</th><th>In</th><th>Out</th><th>Took</th></tr></thead>
+        <tbody id="hb"></tbody>
+      </table>
+      <div class="row">
+        <button class="s" onclick="location.href='/api/export.csv'">Download CSV</button>
+        <button class="s" id="undoBtn">Undo last consultation</button>
+        <button class="r" id="resetBtn">Reset everything</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Adaptive wait-time model</h2>
+      <div class="hint">
+        The estimate starts from an <b>8-minute prior</b> and shifts toward the
+        <b>rolling median</b> of the last 12 consultations measured by the camera
+        (full trust after 4 measurements). ETA shown to patients is ±(25%, 30%).
+      </div>
+    </div>
+  </div>
+</div>
+</main>
+
+<footer>SmartOPD · <a href="/patient" target="_blank">open patient display</a> on the TV/kiosk</footer>
+
+<script src="/static/js/app.js"></script>
+<script>
+$("issueBtn").onclick = async () => {
+  const name = $("pn").value.trim();
+  if (!name) return toast("Enter a patient name");
+  const r = await api("/api/tokens", { method: "POST",
+    body: JSON.stringify({ name, kind: $("pt").value, priority: $("pp2").checked }) });
+  if (r.error) return toast(r.error);
+  $("pn").value = ""; $("pp2").checked = false;
+  toast(`Token #${r.token.no} issued to ${r.token.name}`);
+};
+$("pn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("issueBtn").click(); });
+$("seedBtn").onclick = () => api("/api/tokens/seed", { method: "POST", body: "{}" });
+$("callBtn").onclick = async () => {
+  const r = await api("/api/queue/call-next", { method: "POST", body: "{}" });
+  if (r.error) toast(r.error);
+};
+$("mIn").onclick = () => api("/api/room/enter?src=nurse", { method: "POST", body: "{}" });
+$("mOut").onclick = () => api("/api/room/free?src=nurse", { method: "POST", body: "{}" });
+$("autoAdv").onchange = async () => {
+  await api("/api/settings", { method: "POST",
+    body: JSON.stringify({ auto_advance: $("autoAdv").checked }) });
+  toast($("autoAdv").checked
+    ? "Camera will advance the queue automatically"
+    : "Nurse confirms every admission (camera only detects)");
+};
+$("undoBtn").onclick = async () => {
+  const r = await api("/api/room/undo", { method: "POST", body: "{}" });
+  if (r.error) return toast(r.error);
+  toast(`Token #${r.token.no} returned to the queue`);
+};
+$("resetBtn").onclick = async () => {
+  if (!confirm("Clear all tokens, history and learned times?")) return;
+  await api("/api/reset", { method: "POST", body: "{}" });
+};
+
+$("qb").onclick = async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const r = await api(`/api/tokens/${b.dataset.n}/action`, { method: "POST",
+    body: JSON.stringify({ action: b.dataset.a }) });
+  if (r.error) toast(r.error);
+};
+
+OPD.onState((s) => {
+  $("connBadge").textContent = "live";
+  $("clk").textContent = hhmm(s.server_now);
+  const st = s.stats || {};
+  $("sServed").textContent = st.served ?? 0;
+  $("sWait").textContent = st.waiting ?? 0;
+  $("sAvg").textContent = st.avg_min ?? 8;
+  $("sLearn").textContent = st.learned ?? 0;
+
+  const auto = !!(st.auto_advance ?? true);
+  if ($("autoAdv").checked !== auto) $("autoAdv").checked = auto;
+  $("modeHint").innerHTML = auto
+    ? "When the camera confirms someone inside the doctor room (2&nbsp;s dwell), the " +
+      "next patient is admitted automatically; the one after that becomes <b>NEXT</b>."
+    : "Camera only detects occupancy — the nurse presses <b>Call</b> to admit each patient.";
+
+  // 'next up' = first called, else first waiting (priority, then number)
+  const act = s.tokens.filter((t) => ["called", "waiting"].includes(t.status));
+  const called = act.filter((t) => t.status === "called")
+    .sort((a, b) => (a.t_call || 0) - (b.t_call || 0));
+  const waiting = act.filter((t) => t.status === "waiting")
+    .sort((a, b) => (a.priority === b.priority ? a.no - b.no : (a.priority ? -1 : 1)));
+  const nextNo = (called[0] || waiting[0] || {}).no;
+
+  const r = s.room;
+  const occ = (r && r.occupants) ? r.occupants : [];
+  $("roomHint").innerHTML = occ.length ? "room is occupied" : "room is free";
+  $("roomSt").innerHTML = occ.length
+    ? `<span class="pill in">OCCUPIED</span> ${occ.length} inside · ` +
+      occ.map((o) => o.token_id ? "token #" + o.token_id : "ghost").join(", ") +
+      ` · via ${esc(occ[0].src || "camera")}` +
+      (r.auto ? ' <span class="badge">auto</span>' : "")
+    : `<span class="pill ok">FREE</span>`;
+
+  const eta = s.eta_by_token || {};
+  $("qb").innerHTML = s.tokens
+    .filter((t) => ["waiting", "called", "in", "skipped", "noshow"].includes(t.status))
+    .sort((a, b) => a.no - b.no)
+    .map((t) => {
+      const e = eta[String(t.no)];
+      let waitTxt = "—";
+      if (e) waitTxt = e.hi_s < 90 ? "now" : `${mins(e.lo_s)}–${mins(e.hi_s)} min`;
+      let btns = "";
+      if (t.status === "waiting" || t.status === "called")
+        btns = `<button class="s" data-a="call" data-n="${t.no}">Call</button>
+                <button class="s" data-a="skip" data-n="${t.no}">Skip</button>
+                <button class="s" data-a="noshow" data-n="${t.no}">No-show</button>`;
+      else if (t.status === "skipped" || t.status === "noshow")
+        btns = `<button class="s" data-a="requeue" data-n="${t.no}">Re-queue</button>`;
+      return `<tr>
+        <td><b>#${t.no}</b>${t.priority ? " ⚑" : ""}${t.no === nextNo ? ' <span class="badge" style="background:#f59e0b;color:#2a1a00;margin-left:4px">NEXT</span>' : ""}</td>
+        <td>${esc(t.name)}</td><td>${esc(t.kind)}</td>
+        <td><span class="pill ${t.status}">${t.status === "in" ? "in consultation" : t.status}</span></td>
+        <td>${waitTxt}</td><td>${btns}</td></tr>`;
+    }).join("") || '<tr><td colspan="6">Queue is empty.</td></tr>';
+
+  $("hb").innerHTML = s.tokens.filter((t) => t.status === "done")
+    .sort((a, b) => b.no - a.no)
+    .map((t) => `<tr><td>#${t.no}</td><td>${esc(t.name)}</td>
+      <td>${hhmm(t.t_in)}</td><td>${hhmm(t.t_out)}</td>
+      <td>${t.t_out && t.t_in ? mins(t.t_out - t.t_in) + " min" : "—"}</td></tr>`)
+    .join("") || '<tr><td colspan="5">No completed consultations yet.</td></tr>';
+
+  Voice.enabled = $("say").checked;
+  Voice.maybeAnnounce(s);
+});
+
+OPD.start();
+</script>
+</body>
+</html>

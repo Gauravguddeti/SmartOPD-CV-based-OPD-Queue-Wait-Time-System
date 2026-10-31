@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartOPD · Patient Display</title>
+<link rel="stylesheet" href="/static/css/app.css">
+<style>
+  /* kiosk mode: bigger type, high contrast, auto-refresh */
+  body{background:radial-gradient(1200px 600px at 50% -10%,#101b31,#0b1220)}
+  main{max-width:900px;padding-top:34px}
+  .kboard div{padding:26px 14px}
+  .kboard b{font-size:56px}
+  .kboard small{font-size:13px}
+  .ticker{margin-top:22px;background:#0e1626;border:1px solid var(--line);
+    border-radius:12px;padding:12px 16px;font-size:14px;color:var(--mut);
+    min-height:44px;display:flex;gap:10px;align-items:center}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);
+    animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .lookup{margin-top:22px}
+  input#ptok{font-size:22px;width:130px;text-align:center}
+  .callout{margin-top:14px;font-size:20px;font-weight:700}
+  .called-flash{border-color:var(--warn);box-shadow:0 0 24px #f59e0b33}
+  .called-flash small{color:var(--warn)}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">Smart<span>OPD</span>
+    <small>hospital OPD · live queue status</small></div>
+  <div class="clockbox" style="font-size:16px">Time now <b id="clk" style="font-size:26px">--:--</b></div>
+</header>
+
+<main>
+  <div class="board kboard" id="board">
+    <div><small>IN CONSULTATION</small><b id="bIn">—</b></div>
+    <div><small id="bCallLabel">NEXT UP</small><b id="bCall">—</b></div>
+    <div><small>WAITING</small><b id="bWait">0</b></div>
+  </div>
+
+  <div class="ticker">
+    <span class="dot"></span>
+    <span id="tickerTxt">Waiting for queue updates…</span>
+    <label style="margin-left:auto"><input type="checkbox" id="say" checked> voice announcements</label>
+  </div>
+
+  <div class="card lookup">
+    <h2>Check your token</h2>
+    <div class="row" style="margin-top:0">
+      <input type="number" id="ptok" min="1" placeholder="No.">
+      <button id="findBtn">Track my token</button>
+      <span class="hint">The token number is printed on your slip.</span>
+    </div>
+    <div id="mine" class="callout hint" style="font-weight:400">Enter your token number to see your
+      estimated wait.</div>
+  </div>
+</main>
+
+<footer>SmartOPD · estimates update automatically as the camera measures real consultations</footer>
+
+<script src="/static/js/app.js"></script>
+<script>
+function track(s) {
+  const no = +$("ptok").value;
+  if (!no) return;
+  const t = (s.tokens || []).find((x) => x.no === no);
+  if (!t) { $("mine").innerHTML = '<span class="warn-text">Token not found — please check with the reception desk.</span>'; return; }
+  let h = `<div class="big">#${t.no}</div>
+           <div style="margin:8px 0 14px;font-size:17px">${esc(t.name)} · ${esc(t.kind)}</div>`;
+  const e = (s.eta_by_token || {})[String(no)];
+  if (t.status === "waiting") {
+    h += `<div><b>${e ? e.ahead : "?"}</b> patient(s) ahead of you</div>
+      <div style="font-size:30px;font-weight:800;color:var(--ok);margin:8px 0">
+        ${e && e.hi_s < 90 ? "Almost your turn" : e ? "~" + mins(e.lo_s) + "–" + mins(e.hi_s) + " min" : ""}</div>
+      <div class="hint">Expected around ${e ? hhmm(e.expected_at) : "--:--"}
+      (learned from ${s.stats.learned} real consultations)</div>`;
+  } else if (t.status === "called") {
+    h += `<div class="warn-text" style="font-size:28px">It's your turn — please go to the doctor's room.</div>`;
+  } else if (t.status === "in") {
+    h += `<div class="acc-text" style="font-size:26px">You are in consultation.</div>`;
+  } else if (t.status === "done") {
+    h += `<div class="ok-text" style="font-size:26px">Consultation completed — thank you!</div>`;
+  } else {
+    h += `<div class="hint">Status: ${esc(t.status)} — please check with the reception desk.</div>`;
+  }
+  $("mine").innerHTML = h;
+}
+
+$("findBtn").onclick = () => OPD.state && track(OPD.state);
+$("ptok").addEventListener("keydown", (e) => { if (e.key === "Enter") $("findBtn").click(); });
+
+OPD.onState((s) => {
+  $("clk").textContent = hhmm(s.server_now);
+  const inRoom = (s.room && s.room.occupants && s.room.occupants.length)
+    ? (s.room.no ? "#" + s.room.no : "●") : "—";
+  const called = s.tokens.filter((t) => t.status === "called")
+    .sort((a, b) => (a.t_call || 0) - (b.t_call || 0));
+  const waiting = s.tokens.filter((t) => t.status === "waiting")
+    .sort((a, b) => (a.priority === b.priority ? a.no - b.no : (a.priority ? -1 : 1)));
+  const nextTok = called[0] || waiting[0];
+  $("bIn").textContent = inRoom;
+  $("bCallLabel").textContent = called.length ? "PLEASE PROCEED" : "NEXT UP";
+  $("bCall").textContent = nextTok ? "#" + nextTok.no : "—";
+  $("bWait").textContent = s.stats.waiting;
+  $("bCall").parentElement.classList.toggle("called-flash", called.length > 0);
+
+  const served = s.stats.served;
+  $("tickerTxt").textContent =
+    `${served} patient${served === 1 ? "" : "s"} served today · ` +
+    `average ${s.stats.avg_min} min per consultation · ` +
+    `${s.stats.crowd.waiting} people in the waiting area · ` +
+    `${s.stats.crowd.room || 0} in the doctor's room`;
+
+  Voice.enabled = $("say").checked;
+  Voice.maybeAnnounce(s);
+
+  if ($("ptok").value) track(s);
+  else if (!$("ptok").value && s.tokens.length) $("ptok").value = s.tokens[s.tokens.length - 1].no;
+});
+
+OPD.start();
+</script>
+</body>
+</html>

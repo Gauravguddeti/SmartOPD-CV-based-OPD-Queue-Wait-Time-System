@@ -1,0 +1,49 @@
+REPLAY PROOF — scripts/replay_check.py
+Run: 2026-10-31 · pingpong.mp4 · 3 loops + drain · 6 tokens seeded waiting
+Config: ENTRY_DWELL=2s, MIN_LEARN=4s, TIME_SCALE=60, SEAM_HOLD=1.5s, auto-advance ON
+Zones: wait=[0.0, 0.40, 0.64, 1.0]  doc=[0.68, 0.30, 1.0, 1.0]
+
+----------------------------------------------------------------
+EVENT TIMELINE (oldest first, abridged ghost churn)
+----------------------------------------------------------------
+  [00:00] Token #1..#6 issued (Asha Patil, Rohan Mehta, Sneha Kulkarni,
+          Imran Shaikh, Priya Nair, Vikram Rao)
+  [00:00] [ENTRY_CONFIRMED] person already inside the room zone → ghost occupant
+  [00:02] [EXIT_GHOST] woman who started inside walks out (ghost, no token)
+  [00:06] [ENTRY_CONFIRMED] token #1 (Asha Patil) in consultation admitted automatically
+  [00:14] [EXIT_GHOST] ×2 (detection ID churn inside the zone, no tokens touched)
+  [00:15] [EXIT_LINKED] Room free via camera · token #1 done · consultation 11.0 min
+  [00:20] [ENTRY_CONFIRMED] token #2 (Rohan Mehta) admitted automatically   ← reverse half
+  [00:22] [EXIT_LINKED] token #2 done · consultation 4.6 min
+  [00:26] [ENTRY_CONFIRMED] token #3 (Sneha Kulkarni) admitted automatically
+  [00:35] [EXIT_LINKED] token #3 done · consultation 11.0 min
+  [00:40] [ENTRY_CONFIRMED] token #4 (Imran Shaikh) admitted automatically  ← wrap 2
+  [00:42] [EXIT_LINKED] token #4 done · consultation 4.6 min
+  [00:46] [ENTRY_CONFIRMED] token #5 (Priya Nair) admitted automatically
+  [00:55] [EXIT_LINKED] token #5 done · consultation 11.0 min
+  [01:00] [ENTRY_CONFIRMED] token #6 (Vikram Rao) admitted automatically    ← wrap 3
+  [01:02] [EXIT_LINKED] token #6 done · consultation 4.6 min
+  [01:05] [ENTRY_CONFIRMED] walk-in recorded with no patient in the queue (unlinked)
+  [01:14] [EXIT_GHOST] ×3 (ghost churn after the queue emptied)
+
+----------------------------------------------------------------
+TOKENS
+----------------------------------------------------------------
+  #1 Asha Patil      done    11.0s real = 11.0 min   history=waiting>called>in>done
+  #2 Rohan Mehta     done     4.6s real =  4.6 min   history=waiting>called>in>done
+  #3 Sneha Kulkarni  done    11.0s real = 11.0 min   history=waiting>called>in>done
+  #4 Imran Shaikh    done     4.6s real =  4.6 min   history=waiting>called>in>done
+  #5 Priya Nair      done    11.0s real = 11.0 min   history=waiting>called>in>done
+  #6 Vikram Rao      done     4.6s real =  4.6 min   history=waiting>called>in>done
+
+  served=6/6 · learned=6/6 · avg=7.8 min (model)
+
+----------------------------------------------------------------
+RESULT
+----------------------------------------------------------------
+REPLAY PASS - all tokens completed in order, never backwards,
+every consultation learned
+
+NOTE: with exactly 3 loops the sixth token can only be ADMITTED (the spec's
+own event pattern ends every half-loop with an ENTRY), so the replay drains
+into the next half-loop until #6 completes, then stops.

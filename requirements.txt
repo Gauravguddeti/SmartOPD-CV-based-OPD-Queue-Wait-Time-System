@@ -1,0 +1,9 @@
+# SmartOPD - local dependencies
+# Installed into .venv INSIDE this project folder (never global/system).
+# Exact versions actually installed are frozen in requirements.lock.txt.
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+ultralytics>=8.3
+pytest>=8.0

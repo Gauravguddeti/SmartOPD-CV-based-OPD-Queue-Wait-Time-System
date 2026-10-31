@@ -1,0 +1,23 @@
+# local environment / caches (all inside project, not committed)
+.venv/
+.tmp/
+.pip-cache/
+.ultralytics/
+.torch/
+.mpl/
+.pytest_cache/
+__pycache__/
+*.pyc
+runs/
+.zwork/
+
+# runtime state (created on first run)
+data/state.json
+data/uploads/
+
+# model weights are downloaded automatically on first run (scripts/ensure_ready.py)
+models/*.pt
+
+# OS noise
+Thumbs.db
+.DS_Store

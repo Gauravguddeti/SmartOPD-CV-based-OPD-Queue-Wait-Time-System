@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartOPD · Monitoring Console</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Smart<span>OPD</span>
+    <small>CV queue &amp; wait-time system · monitoring console</small></div>
+  <nav class="roles">
+    <a class="on" href="/">① Monitor</a>
+    <a href="/nurse">② Nurse desk</a>
+    <a href="/patient">③ Patient display</a>
+  </nav>
+  <div class="clockbox">Clinic clock <b id="clk">--:--</b>
+    <span class="badge" id="connBadge">live</span></div>
+</header>
+
+<main>
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>Camera feed · YOLO11n + tracking</h2>
+      <div class="stage">
+        <img id="frame" class="frame" alt="camera feed">
+        <canvas id="zoneCv" width="960" height="540"></canvas>
+        <div class="offline" id="offline" style="display:none">no source selected</div>
+      </div>
+      <div class="row">
+        <label class="btn" for="fileUp" style="background:#26365a">Upload clip</label>
+        <input type="file" id="fileUp" accept="video/*" style="display:none">
+        <select id="sampleSel"><option value="">— demo clip —</option></select>
+        <button class="s" id="loadSample">Load</button>
+        <button class="s" id="camBtn">Use webcam</button>
+        <button class="ghost" id="stopBtn">Stop feed</button>
+      </div>
+      <div class="row">
+        <label><input type="radio" name="zmode" value="wait" checked> draw WAITING zone</label>
+        <label><input type="radio" name="zmode" value="doc"> draw DOCTOR room</label>
+        <button class="w" id="autoBtn">Auto-detect zones</button>
+        <button class="s" id="clearBtn">Clear zones</button>
+      </div>
+      <div class="row"><span class="hint">Drag on the video to draw a zone. Detections are drawn by the
+        server (boxes + track ids); zones are saved with the session and reused for every clip.</span></div>
+      <div class="row"><span class="hint" id="visStatus"></span></div>
+    </div>
+
+    <div class="card">
+      <h2>Manual fallback &amp; simulation</h2>
+      <div class="row">
+        <button class="g" id="mIn">Person ENTERED doctor room</button>
+        <button class="r" id="mOut">Person LEFT doctor room</button>
+        <button class="w" id="simBtn">Simulate next consultation</button>
+      </div>
+      <div class="row"><span class="hint">Use these when no camera is available — the queue and the
+        learning model behave exactly the same.</span></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Live crowd (server-side CV)</h2>
+      <span class="stat"><b id="cAll">0</b><small>people in frame</small></span>
+      <span class="stat"><b id="cWait">0</b><small>in waiting area</small></span>
+      <span class="stat"><b id="cRoom">0</b><small>in doctor room</small></span>
+      <span class="stat"><b id="cPeak">0</b><small>session peak</small></span>
+    </div>
+
+    <div class="card">
+      <h2>Doctor room status</h2>
+      <div id="roomSt" class="hint">—</div>
+    </div>
+
+    <div class="card">
+      <h2>Event log</h2>
+      <div id="log"></div>
+    </div>
+
+    <div class="card">
+      <h2>How the CV pipeline works</h2>
+      <div class="hint">
+        <p>① YOLO11n detects <b>person</b> class only (conf&nbsp;≥&nbsp;0.35), ~10–16 FPS on the server.</p>
+        <p>② A centroid tracker keeps identities across frames (max 15 missed frames before expiry).</p>
+        <p>③ <b>Occupant-based door logic</b>: a person seen walking in from the waiting
+          area and staying ≥&nbsp;2&nbsp;s inside the doctor zone becomes an occupant and takes
+          the next token; people already inside at start are ghosts. Exits are per person — a
+          swap never completes the wrong token.</p>
+        <p>④ With the demo clip looping <b>ping-pong</b> (forward + reversed) the wrap is
+          frame-continuous: the tracker is never reset. Jump-cut sources freeze events for
+          1.5&nbsp;s and re-bind occupants instead.</p>
+        <p>⑤ With <b>camera advances queue</b> on (nurse desk), the next patient is admitted
+          automatically, so the queue and the waiting count drop on their own.</p>
+      </div>
+    </div>
+  </div>
+</div>
+</main>
+
+<footer>SmartOPD · all processing and storage stays inside this machine ·
+  <a href="/api/docs" target="_blank">API docs</a></footer>
+
+<script src="/static/js/app.js"></script>
+<script>
+let ZONES = { wait: null, doc: null };
+let UPLOAD_PATH = null;
+
+const zc = new ZoneCanvas($("zoneCv"),
+  () => ZONES,
+  async (mode, rect) => {
+    ZONES[mode] = rect.map((v) => +v.toFixed(4));
+    await api("/api/zones", { method: "POST", body: JSON.stringify(ZONES) });
+    toast((mode === "wait" ? "Waiting" : "Doctor") + " zone saved");
+  });
+document.querySelectorAll("input[name=zmode]").forEach((r) =>
+  r.onchange = () => zc.mode = r.value);
+
+async function loadSamples() {
+  const s = await api("/api/samples");
+  const sel = $("sampleSel");
+  sel.innerHTML = '<option value="">— demo clip —</option>' +
+    s.samples.map((x) => `<option value="${esc(x.path)}">${esc(x.name)} (${x.size_mb} MB)</option>`).join("");
+}
+loadSamples();
+
+$("loadSample").onclick = async () => {
+  const v = $("sampleSel").value;
+  if (!v) return toast("Pick a clip first");
+  const st = await api("/api/source", { method: "POST", body: JSON.stringify({ kind: "file", value: v }) });
+  toast(st.error ? st.error : "Clip loaded — now draw or auto-detect zones");
+};
+$("camBtn").onclick = async () => {
+  const st = await api("/api/source", { method: "POST", body: JSON.stringify({ kind: "webcam", value: "0" }) });
+  toast(st.error ? st.error : "Webcam live (runs on the server)");
+};
+$("stopBtn").onclick = async () => {
+  await api("/api/vision/stop", { method: "POST", body: "{}" });
+  toast("Feed stopped");
+};
+$("fileUp").onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append("file", f);
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  const j = await r.json();
+  if (!r.ok) return toast(j.error || "upload failed");
+  UPLOAD_PATH = j.path;
+  const st = await api("/api/source", { method: "POST", body: JSON.stringify({ kind: "file", value: j.path }) });
+  toast(st.error ? st.error : "Clip uploaded & loaded");
+  loadSamples();
+};
+$("autoBtn").onclick = async () => {
+  toast("Analysing clip…", 8000);
+  const src = (OPD.state && OPD.state.vision && OPD.state.vision.kind === "file")
+    ? OPD.state.vision.source : UPLOAD_PATH;
+  const res = await api("/api/zones/auto", { method: "POST", body: JSON.stringify({ source: src }) });
+  if (res.ok) {
+    ZONES = { wait: res.wait, doc: res.doc };
+    toast("Zones auto-detected — redraw either one if it looks wrong");
+  } else toast(res.error || "auto-detect failed");
+};
+$("clearBtn").onclick = async () => {
+  ZONES = { wait: null, doc: null };
+  await api("/api/zones", { method: "POST", body: JSON.stringify(ZONES) });
+  toast("Zones cleared");
+};
+$("mIn").onclick = () => api("/api/room/enter?src=manual", { method: "POST", body: "{}" });
+$("mOut").onclick = () => api("/api/room/free?src=manual", { method: "POST", body: "{}" });
+$("simBtn").onclick = async () => {
+  const r = await api("/api/simulate", { method: "POST", body: "{}" });
+  if (r.error) toast(r.error);
+};
+
+OPD.onState((s) => {
+  $("connBadge").textContent = "live";
+  $("clk").textContent = hhmm(s.server_now);
+  ZONES = s.zones || ZONES;
+  const v = s.vision || {};
+  const running = v.running;
+  $("offline").style.display = running ? "none" : "flex";
+  $("cAll").textContent = (s.stats && s.stats.crowd && s.stats.crowd.frame) || 0;
+  $("cWait").textContent = (s.stats && s.stats.crowd && s.stats.crowd.waiting) || 0;
+  $("cRoom").textContent = (s.stats && s.stats.crowd && s.stats.crowd.room) || 0;
+  $("cPeak").textContent = (s.stats && s.stats.peak_crowd) || 0;
+
+  const r = s.room;
+  const durTxt = r && r.t_in ? ` (${mins(s.server_now - r.t_in)} min)` : "";
+  $("roomSt").innerHTML = r && r.occupants && r.occupants.length
+    ? `<span class="pill in">OCCUPIED</span> ${r.occupants.length} inside · ` +
+      r.occupants.map((o) => o.token_id ? "token #" + o.token_id : "ghost").join(", ") +
+      ` · via ${esc(r.src || "camera")}${durTxt}`
+    : r ? `<span class="pill ok">FREE</span>` : `<span class="pill ok">FREE</span>`;
+
+  $("log").innerHTML = (s.events || []).map((e) =>
+    `<div><b>${hhmmss(e.t)}</b>${esc(e.m)}</div>`).join("") ||
+    '<div>No events yet.</div>';
+
+  const bits = [];
+  bits.push(v.detector_ready ? '<span class="ok-text">● detector ready</span>'
+                             : '<span class="warn-text">● detector loading…</span>');
+  bits.push(v.running ? `● ${v.kind} source active` : "● no source");
+  if (v.fps) bits.push(`● inference ${v.fps} fps`);
+  if (v.error) bits.push(`<span class="bad-text">● ${esc(v.error)}</span>`);
+  $("visStatus").innerHTML = bits.join(" &nbsp; ");
+});
+
+startSnapshot("frame", "zoneCv", 4);
+OPD.start();
+</script>
+</body>
+</html>

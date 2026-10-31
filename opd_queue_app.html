@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartOPD – Queue & Wait-Time Predictor</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<style>
+:root{--bg:#0b1220;--card:#131c2e;--line:#22304a;--txt:#e8eefc;--mut:#8fa0c0;--acc:#3b82f6;--ok:#22c55e;--bad:#ef4444;--warn:#f59e0b}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--txt)}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--line)}
+h1{font-size:19px;margin:0}h1 span{color:var(--acc)}
+nav button{background:#1a2640;margin-right:6px}nav button.on{background:var(--acc)}
+.view{display:none;padding:14px;max-width:1250px;margin:auto}.view.on{display:block}
+.grid{display:grid;grid-template-columns:1.4fr 1fr;gap:14px}@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.card h2{font-size:13px;margin:0 0 10px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
+.stage{position:relative;background:#000;border-radius:10px;overflow:hidden;min-height:180px}
+.stage video{width:100%;display:block}.stage canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:9px}
+button,.btn{padding:8px 12px;border:0;border-radius:8px;background:var(--acc);color:#fff;font-weight:600;cursor:pointer;font-size:13px}
+button.s{background:#26365a}button.g{background:var(--ok);color:#04210f}button.r{background:var(--bad)}button.w{background:var(--warn);color:#2a1a00}
+input[type=text],input[type=number],select{padding:8px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt)}
+label{font-size:13px;color:var(--mut)}input[type=file]{display:none}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 5px;text-align:left;border-bottom:1px solid var(--line)}th{color:var(--mut);font-size:11px}
+.pill{padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;background:#26365a}
+.pill.waiting{background:#334155}.pill.called{background:var(--warn);color:#2a1a00}.pill.in{background:var(--acc)}.pill.done{background:var(--ok);color:#04210f}
+.stat{display:inline-block;margin-right:14px}.stat b{font-size:22px;display:block}.stat small{color:var(--mut)}
+#log{max-height:200px;overflow:auto;font-size:12px;color:var(--mut)}#log div{padding:3px 0;border-bottom:1px solid var(--line)}
+.big{font-size:64px;font-weight:800;line-height:1}.board{display:flex;gap:12px}.board div{flex:1;background:#0b1220;border-radius:10px;padding:12px;text-align:center}.board b{font-size:30px;display:block}.board small{color:var(--mut)}
+#msg{font-size:12px;color:var(--warn);margin-top:8px;min-height:16px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart<span>OPD</span> · Queue &amp; Wait-Time Predictor</h1>
+  <nav><button id="n0" class="on">1 · Camera &amp; Zones</button><button id="n1">2 · Nurse desk</button><button id="n2">3 · Patient screen</button></nav>
+  <div><label>Clinic clock <b id="clk" style="color:var(--txt)">09:00</b></label></div>
+</header>
+
+<!-- VIEW 1: CAMERA -->
+<section id="v0" class="view on">
+<div class="grid"><div>
+  <div class="card"><h2>Video input</h2>
+    <div class="stage"><video id="vid" muted playsinline loop></video><canvas id="cv" width="640" height="360"></canvas></div>
+    <div class="row">
+      <label class="btn" for="file">Upload video</label><input type="file" id="file" accept="video/*">
+      <button class="s" id="cam">Use webcam (live)</button>
+      <button class="s" id="pp">Play / Pause</button>
+      <input type="range" id="seek" min="0" max="1000" value="0" style="flex:1;min-width:120px">
+    </div>
+    <div class="row">
+      <label><input type="radio" name="z" value="wait" checked> Draw WAITING area</label>
+      <label><input type="radio" name="z" value="doc"> Draw DOCTOR room / door</label>
+      <button class="w" id="auto">Auto-detect zones</button><button class="s" id="clr">Clear zones</button>
+    </div>
+    <div class="row"><small style="color:var(--mut)">Drag on the video to draw a zone. Zones are kept when you change the clip. Auto-detect is a best guess, so adjust by redrawing.</small></div>
+    <div id="msg">Loading people detector…</div>
+  </div>
+  <div class="card"><h2>Manual fallback &amp; simulation</h2>
+    <div class="row">
+      <button class="g" id="mIn">Person ENTERED doctor room</button><button class="r" id="mOut">Person LEFT doctor room</button>
+      <button class="w" id="sim">Simulate next consultation (no video)</button>
+    </div>
+    <div class="row"><label>Time scale: 1 real second = <input type="number" id="scale" min="1" max="600" style="width:70px"> simulated seconds</label></div>
+  </div>
+</div><div>
+  <div class="card"><h2>Live crowd</h2>
+    <span class="stat"><b id="cAll">0</b><small>In frame</small></span><span class="stat"><b id="cWait">0</b><small>In waiting area</small></span><span class="stat"><b id="cPeak">0</b><small>Peak</small></span>
+  </div>
+  <div class="card"><h2>Room status</h2><div id="roomSt"></div></div>
+  <div class="card"><h2>Event log</h2><div id="log"></div></div>
+</div></div>
+</section>
+
+<!-- VIEW 2: NURSE -->
+<section id="v1" class="view">
+<div class="grid"><div>
+  <div class="card"><h2>Register patient &amp; issue token</h2>
+    <div class="row"><input type="text" id="pn" placeholder="Patient name" style="flex:1;min-width:140px">
+      <select id="pt"><option>New visit</option><option>Follow-up</option></select>
+      <label><input type="checkbox" id="pp2"> Priority</label><button id="issue">Issue token</button></div>
+    <div class="row"><button class="s" id="seed">Add 5 demo patients</button><label><input type="checkbox" id="say" checked> Announce calls aloud</label></div>
+  </div>
+  <div class="card"><h2>Queue</h2>
+    <div class="row" style="margin:0 0 8px"><button class="g" id="callNext">Call next patient</button></div>
+    <table><thead><tr><th>Token</th><th>Patient</th><th>Type</th><th>Status</th><th>ETA</th><th></th></tr></thead><tbody id="qb"></tbody></table>
+  </div>
+</div><div>
+  <div class="card"><h2>Waiting-time model</h2><div id="model"></div></div>
+  <div class="card"><h2>History (completed)</h2>
+    <table><thead><tr><th>Token</th><th>Patient</th><th>In</th><th>Out</th><th>Took</th></tr></thead><tbody id="hb"></tbody></table>
+    <div class="row"><button class="s" id="csv">Download CSV</button><button class="r" id="reset">Reset everything</button></div>
+  </div>
+</div></div>
+</section>
+
+<!-- VIEW 3: PATIENT -->
+<section id="v2" class="view" style="max-width:560px">
+  <div class="card"><h2>Hospital OPD · live status</h2><div class="board" id="board"></div></div>
+  <div class="card"><h2>Your token</h2>
+    <div class="row" style="margin:0 0 12px"><label>Token number <input type="number" id="ptok" min="1" style="width:90px"></label></div>
+    <div id="mine"></div>
+  </div>
+</section>
+
+<script>
+const $=id=>document.getElementById(id), KEY="opd_v1";
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let S=(()=>{try{return JSON.parse(localStorage.getItem(KEY))}catch(e){}})()||{tokens:[],next:1,durs:[],room:null,simT:0,scale:60,Z:{wait:null,doc:null},events:[],peak:0};
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
+setInterval(()=>{S.simT+=.25*S.scale},250); setInterval(save,3000);
+const clock=t=>{t=9*3600+t;return String(Math.floor(t/3600)%24).padStart(2,"0")+":"+String(Math.floor(t%3600/60)).padStart(2,"0")};
+const mins=s=>Math.max(0,Math.round(s/60)), msg=m=>$("msg").textContent=m;
+const log=m=>{S.events.unshift({t:S.simT,m});S.events.length=Math.min(S.events.length,40);save()};
+
+/* ---------- tabs ---------- */
+function show(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k===i);$("n"+k).classList.toggle("on",k===i)});render()}
+[0,1,2].forEach(i=>$("n"+i).onclick=()=>show(i));
+
+/* ---------- queue logic ---------- */
+const order=()=>S.tokens.filter(t=>t.st==="waiting"||t.st==="called").sort((a,b)=>(b.st==="called")-(a.st==="called")||b.pri-a.pri||a.n-b.n);
+function avgDur(){ // learns from completed consultations; starts from an 8 min prior
+  const prior=480,d=S.durs.slice(-10).sort((a,b)=>a-b); if(!d.length) return prior;
+  const med=d[Math.floor(d.length/2)], w=Math.min(1,d.length/4); return prior*(1-w)+med*w;
+}
+function etaFor(t){
+  const q=order(),i=q.findIndex(x=>x.n===t.n); if(i<0) return null;
+  const avg=avgDur(), rem=S.room?Math.max(60,avg-(S.simT-S.room.tIn)):0, sec=rem+i*avg;
+  return {ahead:i,lo:sec*.8,hi:sec*1.25,mid:sec};
+}
+function issue(name,type,pri){S.tokens.push({n:S.next++,name,type,pri:pri?1:0,st:"waiting",tReg:S.simT});save()}
+function callNext(){
+  const t=order().find(x=>x.st==="waiting"); if(!t) return msg("No patients waiting.");
+  t.st="called";t.tCall=S.simT;log(`Token #${t.n} (${t.name}) called`);save();
+  if($("say").checked&&"speechSynthesis" in window) speechSynthesis.speak(new SpeechSynthesisUtterance(`Token number ${t.n}, please proceed to the doctor's room.`));
+}
+function enterRoom(src){
+  if(S.room) return;
+  const t=order().find(x=>x.st==="called");
+  if(t){t.st="in";t.tIn=S.simT;}
+  S.room={n:t?t.n:null,tIn:S.simT};
+  log(`ENTER doctor room (${src})`+(t?` → token #${t.n}`:" → no called token (unlinked)"));save();
+}
+function exitRoom(src){
+  if(!S.room) return;
+  const dur=S.simT-S.room.tIn,t=S.tokens.find(x=>x.n===S.room.n);
+  if(t){t.st="done";t.tOut=S.simT;}
+  S.durs.push(dur);log(`EXIT doctor room (${src}) · consultation ${mins(dur)} min`+(t?` · token #${t.n} done`:""));
+  S.room=null;save();
+}
+function simulate(){
+  if(!order().some(x=>x.st==="called")) callNext();
+  if(S.room) return msg("Room is occupied right now.");
+  setTimeout(()=>enterRoom("simulation"),1200);
+  setTimeout(()=>exitRoom("simulation"),1200+3000+Math.random()*5000);
+}
+
+/* ---------- nurse desk ---------- */
+$("issue").onclick=()=>{const n=$("pn").value.trim();if(!n)return;issue(n,$("pt").value,$("pp2").checked);$("pn").value="";$("pp2").checked=false;render()};
+$("seed").onclick=()=>{["Asha Patil","Rohan Mehta","Sneha Kulkarni","Imran Shaikh","Priya Nair"].forEach((n,i)=>issue(n,i%2?"Follow-up":"New visit",false));render()};
+$("callNext").onclick=()=>{callNext();render()};
+$("qb").onclick=e=>{const b=e.target.closest("button");if(!b)return;const t=S.tokens.find(x=>x.n==b.dataset.n);if(!t)return;
+  const a=b.dataset.a; if(a==="skip")t.st="skipped"; if(a==="no")t.st="noshow"; if(a==="re")t.st="waiting"; save();render()};
+$("csv").onclick=()=>{const rows=[["Token","Patient","Type","Priority","Status","Registered","Called","In","Out","Duration_min"]];
+  S.tokens.forEach(t=>rows.push([t.n,t.name,t.type,t.pri,t.st,clock(t.tReg),t.tCall!=null?clock(t.tCall):"",t.tIn!=null?clock(t.tIn):"",t.tOut!=null?clock(t.tOut):"",t.tOut!=null?mins(t.tOut-t.tIn):""]));
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n")],{type:"text/csv"}));a.download="opd_history.csv";a.click()};
+$("reset").onclick=()=>{if(confirm("Clear all tokens, history and learned times?")){const Z=S.Z;S={tokens:[],next:1,durs:[],room:null,simT:0,scale:S.scale,Z,events:[],peak:0};save();render()}};
+$("mIn").onclick=()=>{enterRoom("manual");render()};$("mOut").onclick=()=>{exitRoom("manual");render()};
+$("sim").onclick=simulate;
+$("scale").value=S.scale;$("scale").oninput=e=>{S.scale=Math.max(1,+e.target.value||60)};
+
+/* ---------- rendering ---------- */
+function render(){
+  $("clk").textContent=clock(S.simT);
+  if($("v0").classList.contains("on")){
+    $("log").innerHTML=S.events.map(e=>`<div><b>${clock(e.t)}</b> ${esc(e.m)}</div>`).join("")||"<div>No events yet.</div>";
+    const r=S.room;$("roomSt").innerHTML=r?`<span class="pill in">OCCUPIED</span> ${r.n?`token #${r.n}`:"unlinked person"} · since ${clock(r.tIn)} (${mins(S.simT-r.tIn)} min)`:`<span class="pill done">FREE</span>`;
+  }
+  if($("v1").classList.contains("on")){
+    $("qb").innerHTML=S.tokens.filter(t=>["waiting","called","in","skipped","noshow"].includes(t.st)).sort((a,b)=>a.n-b.n).map(t=>{
+      const e=t.st==="waiting"||t.st==="called"?etaFor(t):null, eta=e?(e.mid<30?"now":`${mins(e.lo)}–${mins(e.hi)} min`):"–";
+      const btn=t.st==="waiting"||t.st==="called"?`<button class="s" data-a="skip" data-n="${t.n}">Skip</button> <button class="s" data-a="no" data-n="${t.n}">No-show</button>`:t.st==="skipped"||t.st==="noshow"?`<button class="s" data-a="re" data-n="${t.n}">Re-queue</button>`:"";
+      return `<tr><td><b>#${t.n}</b>${t.pri?" ⚑":""}</td><td>${esc(t.name)}</td><td>${esc(t.type)}</td><td><span class="pill ${t.st}">${t.st}</span></td><td>${eta}</td><td>${btn}</td></tr>`}).join("")||`<tr><td colspan="6">Queue is empty.</td></tr>`;
+    $("hb").innerHTML=S.tokens.filter(t=>t.st==="done").map(t=>`<tr><td>#${t.n}</td><td>${esc(t.name)}</td><td>${clock(t.tIn)}</td><td>${clock(t.tOut)}</td><td>${mins(t.tOut-t.tIn)} min</td></tr>`).join("")||`<tr><td colspan="5">No completed consultations yet.</td></tr>`;
+    $("model").innerHTML=`<span class="stat"><b>${mins(avgDur())} min</b><small>Current average per patient</small></span><span class="stat"><b>${S.durs.length}</b><small>Consultations learned from</small></span><div style="font-size:12px;color:var(--mut);margin-top:6px">Starts from an 8-minute prior and shifts to the rolling median of the last 10 consultations measured by the camera.</div>`;
+  }
+  if($("v2").classList.contains("on")){
+    const q=order(),calling=q.filter(x=>x.st==="called").map(x=>"#"+x.n).join(", ");
+    $("board").innerHTML=`<div><small>In consultation</small><b>${S.room?(S.room.n?"#"+S.room.n:"●"):"—"}</b></div><div><small>Please proceed</small><b>${calling||"—"}</b></div><div><small>Waiting</small><b>${q.filter(x=>x.st==="waiting").length}</b></div>`;
+    if(!$("ptok").value&&S.tokens.length)$("ptok").value=S.tokens[S.tokens.length-1].n;
+    const t=S.tokens.find(x=>x.n===+$("ptok").value);let h="";
+    if(!t)h=`<p style="color:var(--mut)">Enter the token number from your slip.</p>`;
+    else{
+      h=`<div class="big">#${t.n}</div><p style="margin:6px 0 12px">${esc(t.name)} · ${esc(t.type)}</p>`;
+      if(t.st==="waiting"){const e=etaFor(t);h+=`<p><b>${e.ahead}</b> patient(s) ahead of you</p><p style="font-size:26px;font-weight:700;color:var(--ok);margin:6px 0">${e.hi<60?"Almost your turn":`~${mins(e.lo)}–${mins(e.hi)} min`}</p><p style="color:var(--mut)">Expected around ${clock(S.simT+e.mid)}</p>`}
+      else if(t.st==="called")h+=`<p style="font-size:24px;font-weight:700;color:var(--warn)">It's your turn. Please go to the doctor's room.</p>`;
+      else if(t.st==="in")h+=`<p style="font-size:20px;font-weight:700;color:var(--acc)">You are in consultation.</p>`;
+      else if(t.st==="done")h+=`<p style="font-size:20px;font-weight:700;color:var(--ok)">Consultation completed. Thank you.</p>`;
+      else h+=`<p>Status: ${t.st}. Please check with the reception desk.</p>`;
+      h+=`<p style="font-size:12px;color:var(--mut);margin-top:10px">Estimate learned from ${S.durs.length} consultations (average ${mins(avgDur())} min).</p>`;
+    }
+    $("mine").innerHTML=h;
+  }
+}
+setInterval(render,500);
+
+/* ---------- camera, zones, detection, tracking ---------- */
+const vid=$("vid"),cv=$("cv");let model=null,tracks=[],tid=1,mode="wait",drag=null,cool={enter:0,exit:0};
+document.querySelectorAll("input[name=z]").forEach(r=>r.onchange=()=>mode=r.value);
+vid.addEventListener("loadedmetadata",()=>{cv.width=vid.videoWidth;cv.height=vid.videoHeight;tracks=[]});
+$("file").onchange=e=>{const f=e.target.files[0];if(!f)return;if(vid.srcObject){vid.srcObject.getTracks().forEach(t=>t.stop());vid.srcObject=null}
+  vid.src=URL.createObjectURL(f);vid.play().catch(()=>{});msg("Clip loaded. Draw or auto-detect the zones.")};
+$("cam").onclick=async()=>{try{vid.removeAttribute("src");vid.srcObject=await navigator.mediaDevices.getUserMedia({video:true});await vid.play();msg("Webcam live.")}
+  catch(e){msg("Webcam unavailable: "+e.message+" (needs Chrome on localhost or https)")}};
+$("pp").onclick=()=>vid.paused?vid.play():vid.pause();
+vid.addEventListener("timeupdate",()=>{if(vid.duration&&isFinite(vid.duration))$("seek").value=vid.currentTime/vid.duration*1000});
+$("seek").oninput=e=>{if(vid.duration&&isFinite(vid.duration))vid.currentTime=e.target.value/1000*vid.duration};
+$("clr").onclick=()=>{S.Z={wait:null,doc:null};save()};
+const pt=e=>{const b=cv.getBoundingClientRect();return[(e.clientX-b.left)/b.width,(e.clientY-b.top)/b.height]};
+cv.onpointerdown=e=>{const p=pt(e);drag={x:p[0],y:p[1],x2:p[0],y2:p[1]};cv.setPointerCapture(e.pointerId)};
+cv.onpointermove=e=>{if(drag){const p=pt(e);drag.x2=p[0];drag.y2=p[1]}};
+cv.onpointerup=()=>{if(!drag)return;const r=[Math.min(drag.x,drag.x2),Math.min(drag.y,drag.y2),Math.max(drag.x,drag.x2),Math.max(drag.y,drag.y2)];
+  if(r[2]-r[0]>.02&&r[3]-r[1]>.02){S.Z[mode]=r;save()}drag=null};
+const inZ=(z,x,y)=>!!z&&x>=z[0]&&x<=z[2]&&y>=z[1]&&y<=z[3];
+
+function fire(k){const n=Date.now();if(n-cool[k]<2500)return;cool[k]=n;k==="enter"?enterRoom("camera"):exitRoom("camera")}
+function process(P){
+  const W=vid.videoWidth,H=vid.videoHeight,Z=S.Z,used=new Set();
+  const dets=P.map(p=>({x:(p.bbox[0]+p.bbox[2]/2)/W,y:(p.bbox[1]+p.bbox[3]*.8)/H,b:p.bbox}));
+  tracks.forEach(t=>{
+    let bi=-1,bd=.15;dets.forEach((d,i)=>{if(used.has(i))return;const dd=Math.hypot(d.x-t.x,d.y-t.y);if(dd<bd){bd=dd;bi=i}});
+    if(bi<0){t.miss++;return}
+    used.add(bi);const d=dets[bi],was=t.inDoc;Object.assign(t,{x:d.x,y:d.y,b:d.b,miss:0});
+    t.inDoc=inZ(Z.doc,d.x,d.y);t.inWait=inZ(Z.wait,d.x,d.y);if(!t.inDoc)t.wasOut=true;
+    if(!was&&t.inDoc){t.entered=true;fire("enter")} if(was&&!t.inDoc)fire("exit");
+  });
+  dets.forEach((d,i)=>{if(used.has(i))return;const inD=inZ(Z.doc,d.x,d.y);
+    tracks.push({id:tid++,x:d.x,y:d.y,b:d.b,miss:0,inDoc:inD,inWait:inZ(Z.wait,d.x,d.y),entered:false,wasOut:!inD});
+    if(inD&&S.room)fire("exit")});               // someone appears at the door while room is occupied = consultation finished
+  tracks=tracks.filter(t=>{if(t.miss>10){if(t.inDoc&&!t.entered&&t.wasOut)fire("enter");return false}return true});  // vanished into the door
+  const vis=tracks.filter(t=>t.miss===0),w=vis.filter(t=>t.inWait).length;S.peak=Math.max(S.peak,vis.length);
+  $("cAll").textContent=vis.length;$("cWait").textContent=w;$("cPeak").textContent=S.peak;
+}
+async function detLoop(){
+  if(model&&vid.readyState>=2&&!vid.paused&&!vid.ended){try{const r=await model.detect(vid,20,.5);process(r.filter(p=>p.class==="person"))}catch(e){}}
+  setTimeout(detLoop,60);
+}
+function draw(){
+  const c=cv.getContext("2d"),W=cv.width,H=cv.height;c.clearRect(0,0,W,H);c.lineWidth=Math.max(2,W/300);const fs=Math.max(13,W/48);c.font=`bold ${fs}px system-ui`;
+  const rect=(r,col,lab)=>{if(!r)return;c.strokeStyle=col;c.fillStyle=col+"33";c.fillRect(r[0]*W,r[1]*H,(r[2]-r[0])*W,(r[3]-r[1])*H);
+    c.strokeRect(r[0]*W,r[1]*H,(r[2]-r[0])*W,(r[3]-r[1])*H);c.fillStyle=col;c.fillText(lab,r[0]*W+5,r[1]*H+fs+2)};
+  rect(S.Z.wait,"#3b82f6","WAITING");rect(S.Z.doc,"#f59e0b","DOCTOR ROOM / DOOR");
+  if(drag)rect([Math.min(drag.x,drag.x2),Math.min(drag.y,drag.y2),Math.max(drag.x,drag.x2),Math.max(drag.y,drag.y2)],mode==="wait"?"#3b82f6":"#f59e0b","");
+  tracks.forEach(t=>{if(t.miss>0)return;const[x,y,w,h]=t.b;c.strokeStyle=c.fillStyle=t.inDoc?"#f59e0b":t.inWait?"#22c55e":"#e5e7eb";c.strokeRect(x,y,w,h);c.fillText("#"+t.id,x+3,y-5)});
+  requestAnimationFrame(draw);
+}
+
+/* Auto-detect zones: sample frames; people present in most samples = waiting area; transient people far from it = door */
+$("auto").onclick=async()=>{
+  if(!model)return msg("Detector still loading…");
+  if(vid.srcObject||!vid.duration||!isFinite(vid.duration))return msg("Auto-detect needs an uploaded video clip.");
+  vid.pause();const keep=vid.currentTime,N=12,GX=16,GY=9,cnt=new Array(GX*GY).fill(0),all=[];msg("Analysing clip…");
+  for(let i=0;i<N;i++){
+    vid.currentTime=vid.duration*(i+.5)/N;await new Promise(r=>vid.addEventListener("seeked",r,{once:true}));
+    const seen=new Set();
+    (await model.detect(vid,20,.5)).filter(p=>p.class==="person").forEach(p=>{
+      const x=(p.bbox[0]+p.bbox[2]/2)/vid.videoWidth,y=(p.bbox[1]+p.bbox[3]*.8)/vid.videoHeight;all.push([x,y]);
+      seen.add(Math.min(GY-1,y*GY|0)*GX+Math.min(GX-1,x*GX|0))});
+    seen.forEach(k=>cnt[k]++);
+  }
+  vid.currentTime=keep;
+  const mx=Math.max(...cnt);if(!mx)return msg("No people found. Draw the zones manually.");
+  const cells=cnt.map((c,k)=>[c,k]).filter(a=>a[0]>=Math.max(1,mx*.6)).map(a=>[a[1]%GX,a[1]/GX|0]);
+  const xs=cells.map(c=>c[0]),ys=cells.map(c=>c[1]);
+  const wz=[Math.max(0,(Math.min(...xs)-1)/GX),Math.max(0,(Math.min(...ys)-1)/GY),Math.min(1,(Math.max(...xs)+2)/GX),Math.min(1,(Math.max(...ys)+2)/GY)];
+  S.Z.wait=wz;
+  const cx=(wz[0]+wz[2])/2,cy=(wz[1]+wz[3])/2,out=all.filter(p=>!inZ(wz,p[0],p[1])).sort((a,b)=>Math.hypot(b[0]-cx,b[1]-cy)-Math.hypot(a[0]-cx,a[1]-cy));
+  if(out.length){const f=out.slice(0,Math.max(2,Math.ceil(out.length*.3))),px=f.map(p=>p[0]),py=f.map(p=>p[1]);
+    S.Z.doc=[Math.max(0,Math.min(...px)-.05),Math.max(0,Math.min(...py)-.08),Math.min(1,Math.max(...px)+.05),Math.min(1,Math.max(...py)+.08)];
+    msg("Zones auto-detected (best guess). Redraw either one if it looks wrong.")}
+  else msg("Waiting area found, but nobody walks to a door in this clip. Draw the DOCTOR zone manually.");
+  save();
+};
+
+cocoSsd.load({base:"lite_mobilenet_v2"}).then(m=>{model=m;msg("Detector ready. Upload a video or start the webcam.")}).catch(e=>msg("Detector failed to load (needs internet): "+e.message));
+detLoop();draw();render();
+</script>
+</body>
+</html>
