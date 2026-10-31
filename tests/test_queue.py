@@ -209,15 +209,17 @@ def test_duration_learned_above_min_only():
     assert eng.durations == [10]
 
 
-def test_time_scale_inflates_model_durations():
+def test_time_scale_stores_raw_and_scales_model():
+    """Durations are stored RAW; the demo factor is applied at model time."""
     eng, clk = make_engine(scale=config.TIME_SCALE)
     eng.register("A")
     eng.begin_occupant("t1", clk(), ghost=False)
     clk.advance(10)                           # 10 real seconds
     eng.remove_occupant("t1")
-    assert eng.durations == [600]             # 10 min of model time
-    # avg = 0.75*prior(8 min) + 0.25*measured(10 min) = 8.5 model-min
-    assert abs(eng.avg_seconds() - 510.0) < 0.1
+    assert eng.durations == [10]              # raw seconds stored
+    # model view: prior 8 min blended 25 % with the measured 10 s x 25/60
+    expected = 8.0 * 0.75 + (10 * config.TIME_SCALE / 60.0) * 0.25
+    assert abs(eng.avg_model_minutes() - expected) < 0.01
 
 
 def test_time_scale_shortens_real_learn_gate():
@@ -230,23 +232,43 @@ def test_time_scale_shortens_real_learn_gate():
     eng.remove_occupant("t1")
     assert eng.durations == []
     eng.begin_occupant("t2", clk(), ghost=False)
-    clk.advance(5)                            # 5 real s = 5 model minutes
+    clk.advance(5)                            # 5 real s, stored raw
     eng.remove_occupant("t2")
-    assert eng.durations == [300]
+    assert eng.durations == [5]
 
 
-def test_eta_uses_scaled_elapsed_and_wallclock():
+def test_eta_uses_fuzzy_and_wallclock():
+    """Fuzzy ETA: mid is a clinic-minute figure; the wall-clock expectation
+    converts it back through the demo time factor."""
     eng, clk = make_engine(scale=config.TIME_SCALE)
-    a = eng.register("A")
+    eng.register("A")
     b = eng.register("B")
     eng.begin_occupant("t1", clk(), ghost=False)     # A admitted at t
-    clk.advance(10)                                  # 10 real s = 10 model min
+    clk.advance(10)                                  # 10 real s elapsed
     e = eng.eta(b.no)
     assert e is not None and e["ahead"] == 0
-    # remaining = avg(8 min) - elapsed(10 min) floored at 1 min
-    assert e["mid_s"] == 60
-    # wall-clock expectation stays in real time (10 model min -> 10 real s)
-    assert abs(e["expected_at"] - (clk() + 1.0)) < 1.0
+    assert e["label"] and e["confidence"] in ("high", "medium", "low")
+    assert 0 < e["lo_s"] <= e["mid_s"] <= e["hi_s"]
+    # expected_at is REAL wall time: mid clinic-min / factor = real seconds
+    real_seconds = e["mid_s"] / config.TIME_SCALE
+    assert abs(e["expected_at"] - (clk() + real_seconds)) < 1.0
+
+
+def test_time_scale_slider_rescales_history():
+    """Moving the demo time factor must re-scale every stored measurement."""
+    eng, clk = make_engine(scale=25.0)
+    eng.register("A")
+    eng.register("B")
+    eng.begin_occupant("t", clk(), ghost=False)
+    clk.advance(12)                                  # 12 real s
+    eng.remove_occupant("t")
+    assert eng.durations == [12]
+    at25 = eng.avg_model_minutes()                   # blend: 0.75*8 + 0.25*5
+    assert 6.5 <= at25 <= 8.0
+    eng.time_scale = 120.0                           # nurse slides the slider
+    at120 = eng.avg_model_minutes()                  # blend: 0.75*8 + 0.25*24
+    assert 11.0 <= at120 <= 13.0
+    assert at120 > at25
 
 
 # ------------------------------------------------------- manual overrides

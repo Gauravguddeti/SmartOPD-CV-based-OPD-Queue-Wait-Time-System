@@ -31,6 +31,8 @@ import time
 from dataclasses import asdict, dataclass
 
 import config
+import fuzzy
+from fuzzy import estimate as fuzzy_estimate
 
 TOKEN_STATUSES = ("waiting", "called", "in", "done", "skipped", "noshow")
 
@@ -125,11 +127,25 @@ class QueueEngine:
                     tok.history = [tok.status]
                 eng.tokens.append(tok)
             eng.next_no = int(data.get("next_no", len(eng.tokens) + 1))
-            eng.durations = [float(d) for d in data.get("durations", [])]
+            # durations are stored in RAW video seconds; older saves stored
+            # clinic-scaled values, so divide them back by the scale that was
+            # active when they were written
             room = data.get("room") or {}
+            saved_scale = None
+            if isinstance(room, dict) and room.get("scale"):
+                try:
+                    saved_scale = float(room["scale"])
+                except (TypeError, ValueError):
+                    saved_scale = None
+            if not saved_scale or saved_scale <= 0:
+                saved_scale = config.TIME_SCALE   # no scale recorded
+            eng.time_scale = max(0.5, min(120.0, saved_scale))
+            eng.durations = [float(d) / saved_scale
+                             for d in data.get("durations", [])]
             if isinstance(room, dict) and isinstance(room.get("occupants"), list):
                 eng.room["occupants"] = [o for o in room["occupants"]
                                          if isinstance(o, dict)]
+            eng.room["scale"] = eng.time_scale
             eng.events = list(data.get("events", []))
             eng.peak_crowd = int(data.get("peak_crowd", 0))
             eng.auto_advance = bool(data.get("auto_advance", True))
@@ -284,14 +300,15 @@ class QueueEngine:
                 if t and t.status == "in":
                     t.set_status("done")
                     t.t_out = now
-                dur_model = dur_real * self.time_scale
+                # store RAW seconds; the demo time factor is applied at model
+                # time, so changing the factor re-scales the whole history
                 learn = dur_real >= config.MIN_LEARN_SECONDS
                 if learn:
-                    self.durations.append(dur_model)
+                    self.durations.append(dur_real)
                 extra = "" if learn else " (too short to learn from)"
                 who = f"token #{t.no}" if t else "token"
                 self._log(f"[EXIT_LINKED] Room free via {src} · {who} done · "
-                          f"consultation {dur_model / 60:.1f} min{extra}")
+                          f"consultation {dur_real * self.time_scale / 60:.1f} min{extra}")
             else:
                 self._log(f"[EXIT_GHOST] person left the doctor zone via {src} "
                           f"(no token linked)")
@@ -382,40 +399,71 @@ class QueueEngine:
             return ""
 
     # -------------------------------------------------------------- analytics
-    def avg_seconds(self) -> float:
-        """Adaptive consultation length in MODEL seconds: 8-min prior blended
-        into the rolling median of the last LEARN_WINDOW consultations."""
+    def avg_model_minutes(self) -> float:
+        """Adaptive consultation length in CLINIC minutes: the 8-minute prior
+        blended into the rolling median of the last LEARN_WINDOW measurements
+        (raw video seconds x the demo time factor)."""
         with self._lock:
-            d = sorted(self.durations[-config.LEARN_WINDOW:])
-            if not d:
-                return config.PRIOR_SECONDS
-            med = statistics.median(d)
-            w = min(1.0, len(d) / config.LEARN_RAMP)
-            return config.PRIOR_SECONDS * (1 - w) + med * w
+            win = self.durations[-config.LEARN_WINDOW:]
+            prior_min = config.PRIOR_SECONDS / 60.0
+            if not win:
+                return prior_min
+            med_min = statistics.median(win) * self.time_scale / 60.0
+            w = min(1.0, len(win) / config.LEARN_RAMP)
+            return prior_min * (1 - w) + med_min * w
+
+    def avg_seconds(self) -> float:
+        """Compatibility helper: the learned average in model seconds."""
+        return self.avg_model_minutes() * 60.0
+
+    def _fuzzy_inputs(self) -> tuple[float, int, float]:
+        """(avg clinic minutes, sample count, coefficient of variation)."""
+        win = self.durations[-config.LEARN_WINDOW:]
+        if not win:
+            return config.PRIOR_SECONDS / 60.0, 0, 1.0
+        mean = sum(win) / len(win)
+        avg_min = mean * self.time_scale / 60.0
+        if len(win) < 2 or mean <= 0:
+            return avg_min, len(win), 1.0
+        var = sum((x - mean) ** 2 for x in win) / len(win)
+        return avg_min, len(win), (var ** 0.5) / mean
 
     def eta(self, no: int) -> dict | None:
+        """Fuzzy wait estimate for a waiting/called token.
+
+        The crisp remainder+ahead formula is replaced by the Mamdani system in
+        app/fuzzy.py: it reasons with the learned average, how much data backs
+        it (samples + spread), the position in the queue and the progress of
+        the consultation currently in the room.  Returns model seconds plus a
+        linguistic label and a confidence tag for the screens.
+        """
         with self._lock:
             t = self._find(no)
             if t.status not in ("waiting", "called"):
                 return None
             order = self.queue_order()
             ahead = next(i for i, x in enumerate(order) if x.no == no)
-            avg = self.avg_seconds()                      # model seconds
-            rem = 0.0
+            avg_min, samples, cv = self._fuzzy_inputs()
+            progress = None
             linked = [o for o in self.room["occupants"]
                       if o.get("token_id") is not None]
-            if linked:
+            if linked and samples:
                 oldest = min(linked, key=lambda o: o.get("t_in") or 0)
-                elapsed_model = max(0.0, self.now() - oldest["t_in"]) * self.time_scale
-                rem = max(60.0, avg - elapsed_model)
-            mid = rem + ahead * avg                       # model seconds
+                avg_raw = max(0.5, sum(self.durations[-config.LEARN_WINDOW:])
+                              / samples)
+                progress = max(0.0, (self.now() - oldest["t_in"]) / avg_raw)
+            res = fuzzy_estimate(avg_min=avg_min, samples=samples, cv=cv,
+                                 ahead=ahead, progress=progress)
             return {
                 "ahead": ahead,
-                "mid_s": round(mid, 1),
-                "lo_s": round(mid * config.ETA_LO_FACTOR, 1),
-                "hi_s": round(mid * config.ETA_HI_FACTOR, 1),
-                # wall-clock estimate: convert model seconds back to real time
-                "expected_at": self.now() + mid / max(1e-6, self.time_scale),
+                "mid_s": round(res.mid_min * 60, 1),
+                "lo_s": round(res.lo_min * 60, 1),
+                "hi_s": round(res.hi_min * 60, 1),
+                "label": res.label,
+                "confidence": res.confidence,
+                # wall-clock estimate: model minutes back to real seconds
+                "expected_at": self.now() + res.mid_min * 60.0
+                / max(1e-6, self.time_scale),
             }
 
     def update_crowd(self, frame: int, waiting: int, room: int = 0) -> None:
@@ -434,12 +482,13 @@ class QueueEngine:
                 "served": served,
                 "waiting": waiting,
                 "called": called,
-                "avg_min": _mins(self.avg_seconds()),
+                "avg_min": round(self.avg_model_minutes()),
                 "learned": len(self.durations),
                 "peak_crowd": self.peak_crowd,
                 "crowd": self.crowd,
                 "auto_advance": self.auto_advance,
                 "time_scale": self.time_scale,
+                "spread_cv": round(self._fuzzy_inputs()[2], 2),
                 "occupants": len(self.room["occupants"]),
             }
 

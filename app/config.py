@@ -34,8 +34,9 @@ PRIOR_SECONDS = 480.0      # 8-min prior (in MODEL seconds) before learning kick
 LEARN_WINDOW = 12          # rolling window of measured consultations
 LEARN_RAMP = 4             # full trust in measured median after N samples
 MIN_LEARN_SECONDS = 4.0    # real-seconds: shorter consultations do not train the model
-TIME_SCALE = 60.0          # model-seconds per real second for FILE sources
-                           # (webcam = 1.0) so short demo clips yield realistic minutes
+TIME_SCALE = 25.0          # DEMO time factor: clinic-minutes per video-second for FILE
+                           # sources (webcam = 1.0).  10-15 s of clip ≈ 4-6 min of clinic
+                           # time.  Tunable live from the nurse desk (10-120).
 ETA_LO_FACTOR = 0.75
 ETA_HI_FACTOR = 1.30
 

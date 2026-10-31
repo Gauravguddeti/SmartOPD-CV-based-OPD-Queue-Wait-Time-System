@@ -109,6 +109,7 @@ class ActionIn(BaseModel):
 
 class SettingsIn(BaseModel):
     auto_advance: bool | None = None
+    time_scale: float | None = None      # demo time factor (clinic-min per video-s)
 
 
 class SourceIn(BaseModel):
@@ -232,6 +233,14 @@ def update_settings(body: SettingsIn):
                        ("camera advances the queue automatically"
                         if engine.auto_advance else
                         "nurse confirms every admission"))
+    if body.time_scale is not None:
+        ts = max(10.0, min(120.0, float(body.time_scale)))
+        with engine._lock:
+            engine.time_scale = ts
+            engine.room["scale"] = ts
+            engine.version += 1
+            engine._log(f"Demo time factor set to ×{ts:g} "
+                        f"(1 video-s ≈ {ts/60:.1f} clinic-min)")
     return {"state": _full_state()}
 
 

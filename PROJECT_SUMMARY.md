@@ -40,8 +40,8 @@ ever leave the building (privacy by design).
 | Tracking | naive nearest-match in JS, flicker caused false door events | centroid tracker + **direction-aware, time-confirmed** zone state machine |
 | Queue link | camera events never touched the queue (unlinked) | **camera drives the queue** (auto-advance) with pass-by protection and nurse override |
 | State | browser `localStorage` (one screen only) | server-side JSON, shared by all three screens, atomic writes, crash-safe |
-| Wait-time model | 8-min prior + last-10 median (could be poisoned by 0-min readings) | same idea, formalised + **outlier-guarded** (sub-4 s readings never train it) + unit tests |
-| Ops | none | one-click `run.bat`, local `.venv`, locked dependencies, 47 tests, API docs at `/api/docs` |
+| Wait-time model | 8-min prior + last-10 median (could be poisoned by 0-min readings) | prior→median blend **+ Mamdani fuzzy ETA** (confidence, spread, queue position, live-consultation progress) + outlier guard |
+| Ops | none | one-click `run.bat`, local `.venv`, locked dependencies, 58 tests, replay proof, API docs at `/api/docs` |
 
 ## 4. Architecture
 
@@ -159,15 +159,23 @@ CSV export · reset.
 ahead*, an ETA range, and the expected clock time. Voice announcements
 ("Token number 5, please proceed…") are spoken by the browser on the nurse desk and TV.
 
-## 7. The adaptive wait-time model
+## 7. The adaptive wait-time model — fuzzy logic
 
-- Starts from an **8-minute prior** (typical OPD consultation).
-- As the camera measures real consultations, it blends toward the **rolling median of the
-  last 12** measurements, reaching full trust after 4 samples.
+- The learned average starts from an **8-minute prior** and blends toward the **rolling
+  median of the last 12** camera-measured consultations (full trust after 4 samples):
   `estimate = prior·(1−w) + median·w`, with `w = min(1, n/4)`.
-- **TIME_SCALE** multiplies measured durations before they enter the model (60 for video
-  clips, 1 for a live webcam), so a 10-second demo consultation becomes a realistic
-  10-minute one without changing the algorithm.
+- A **Mamdani fuzzy inference layer** (`app/fuzzy.py`, pure Python) then shapes the estimate.
+  Inputs → fuzzy sets: consultation length (short / medium / long), measurement confidence
+  (from sample count), measurement spread (coefficient of variation: tight / moderate / wide),
+  queue position (none / few / many) and progress of the live consultation (just started /
+  mid / likely ending). A consultation that has already overrun its average sharply pulls the
+  first waiting patient's estimate down ("almost your turn").
+- The rules defuzzify (centroid) to a wait **range** with a **confidence tag** (high / medium /
+  low) — little data or high spread widens the bounds instead of pretending precision.
+- **Demo time factor**: durations are stored in raw clip seconds and multiplied by the factor
+  (default ×25, live slider on the nurse desk, ×1 for a real webcam) at estimate time, so a
+  10–15-second clip consultation reads as 4–6 clinic minutes and sliding the factor re-scales
+  every stored measurement instantly.
 - ETA for a waiting token = **remaining time of the current consultation** (average minus
   elapsed, floored at 1 min) + **(people ahead) × average**, shown as a range
   −25 % / +30 % and converted to an expected clock time.
@@ -176,10 +184,11 @@ ahead*, an ETA range, and the expected clock time. Voice announcements
 
 ## 8. Engineering quality
 
-- **47 unit tests** (pytest): token lifecycle, priority ordering, occupant admissions, swaps,
+- **58 unit tests** (pytest): token lifecycle, priority ordering, occupant admissions, swaps,
   ghost exits, never-backwards invariant, TIME_SCALE learning gates, undo, model
   convergence, serialisation/migration, CSV export; tracker identity/expiry; entry dwell,
-  pass-by, flicker, vanish exits, seam hold/re-bind, continuous loop identity, crowd counts.
+  pass-by, flicker, vanish exits, seam hold/re-bind, continuous loop identity, crowd counts;
+  fuzzy monotonicity, confidence-widens-spread, prior fallback and label buckets.
 - **Replay proof**: `scripts/replay_check.py` runs the real pipeline headless over the
   ping-pong demo clip for 3 loops and asserts that six tokens complete in order, never move
   backwards, and all train the ETA model.

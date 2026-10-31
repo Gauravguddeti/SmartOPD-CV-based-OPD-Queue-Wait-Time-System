@@ -86,11 +86,19 @@
     </div>
 
     <div class="card">
-      <h2>Adaptive wait-time model</h2>
+      <h2>Adaptive wait-time model · fuzzy logic</h2>
+      <div class="row" style="margin:0 0 8px">
+        <label style="min-width:170px">Demo time factor ×<b id="tsVal"></b></label>
+        <input type="range" id="tsSlider" min="10" max="120" step="5" style="flex:1;min-width:150px">
+      </div>
+      <div class="hint" id="fuzzyInfo" style="margin-bottom:8px"></div>
       <div class="hint">
-        The estimate starts from an <b>8-minute prior</b> and shifts toward the
-        <b>rolling median</b> of the last 12 consultations measured by the camera
-        (full trust after 4 measurements). ETA shown to patients is ±(25%, 30%).
+        A <b>fuzzy inference layer</b> (consultation length, sample confidence, measurement
+        spread, queue position, progress of the live consultation) shapes the wait range and
+        its confidence tag. Estimates start from an <b>8-minute prior</b> and shift toward the
+        <b>rolling median</b> of the last 12 camera-measured consultations. The demo time
+        factor converts clip seconds into clinic minutes — slide it during the demo and every
+        estimate re-scales instantly.
       </div>
     </div>
   </div>
@@ -111,6 +119,16 @@ $("issueBtn").onclick = async () => {
   toast(`Token #${r.token.no} issued to ${r.token.name}`);
 };
 $("pn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("issueBtn").click(); });
+let tsDebounce = null;
+$("tsSlider").oninput = () => {
+  $("tsVal").textContent = $("tsSlider").value;
+  clearTimeout(tsDebounce);
+  tsDebounce = setTimeout(async () => {
+    await api("/api/settings", { method: "POST",
+      body: JSON.stringify({ time_scale: +$("tsSlider").value }) });
+    toast(`Demo time factor ×${$("tsSlider").value} — estimates re-scaled`);
+  }, 400);
+};
 $("seedBtn").onclick = () => api("/api/tokens/seed", { method: "POST", body: "{}" });
 $("callBtn").onclick = async () => {
   const r = await api("/api/queue/call-next", { method: "POST", body: "{}" });
@@ -159,6 +177,13 @@ OPD.onState((s) => {
       "next patient is admitted automatically; the one after that becomes <b>NEXT</b>."
     : "Camera only detects occupancy — the nurse presses <b>Call</b> to admit each patient.";
 
+  const ts = Math.round(st.time_scale || 25);
+  if (document.activeElement !== $("tsSlider")) $("tsSlider").value = ts;
+  $("tsVal").textContent = ts;
+  $("fuzzyInfo").innerHTML =
+    `Learned average <b>${st.avg_min} min</b> from ${st.learned} measurement(s) · ` +
+    `spread ${st.spread_cv ?? "—"} · factor ×${ts}`;
+
   // 'next up' = first called, else first waiting (priority, then number)
   const act = s.tokens.filter((t) => ["called", "waiting"].includes(t.status));
   const called = act.filter((t) => t.status === "called")
@@ -183,8 +208,11 @@ OPD.onState((s) => {
     .sort((a, b) => a.no - b.no)
     .map((t) => {
       const e = eta[String(t.no)];
-      let waitTxt = "—";
-      if (e) waitTxt = e.hi_s < 90 ? "now" : `${mins(e.lo_s)}–${mins(e.hi_s)} min`;
+      let waitTxt = "—", confTxt = "";
+      if (e) {
+        waitTxt = e.hi_s < 90 ? "now" : `${mins(e.lo_s)}–${mins(e.hi_s)} min`;
+        confTxt = `<div class="hint" style="font-size:10px;margin-top:2px">${e.confidence} confidence</div>`;
+      }
       let btns = "";
       if (t.status === "waiting" || t.status === "called")
         btns = `<button class="s" data-a="call" data-n="${t.no}">Call</button>
@@ -196,7 +224,7 @@ OPD.onState((s) => {
         <td><b>#${t.no}</b>${t.priority ? " ⚑" : ""}${t.no === nextNo ? ' <span class="badge" style="background:#f59e0b;color:#2a1a00;margin-left:4px">NEXT</span>' : ""}</td>
         <td>${esc(t.name)}</td><td>${esc(t.kind)}</td>
         <td><span class="pill ${t.status}">${t.status === "in" ? "in consultation" : t.status}</span></td>
-        <td>${waitTxt}</td><td>${btns}</td></tr>`;
+        <td>${waitTxt}${confTxt}</td><td>${btns}</td></tr>`;
     }).join("") || '<tr><td colspan="6">Queue is empty.</td></tr>';
 
   $("hb").innerHTML = s.tokens.filter((t) => t.status === "done")

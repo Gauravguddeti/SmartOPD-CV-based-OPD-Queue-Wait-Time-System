@@ -73,6 +73,7 @@ function track(s) {
     h += `<div><b>${e ? e.ahead : "?"}</b> patient(s) ahead of you</div>
       <div style="font-size:30px;font-weight:800;color:var(--ok);margin:8px 0">
         ${e && e.hi_s < 90 ? "Almost your turn" : e ? "~" + mins(e.lo_s) + "–" + mins(e.hi_s) + " min" : ""}</div>
+      ${e ? `<div class="hint">${e.label} · ${e.confidence} confidence</div>` : ""}
       <div class="hint">Expected around ${e ? hhmm(e.expected_at) : "--:--"}
       (learned from ${s.stats.learned} real consultations)</div>`;
   } else if (t.status === "called") {

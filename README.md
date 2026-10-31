@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.11-blue)
 ![YOLO11n](https://img.shields.io/badge/model-YOLO11n-00A3E0)
 ![FastAPI](https://img.shields.io/badge/server-FastAPI-009688)
-![Tests](https://img.shields.io/badge/tests-47%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 A computer-vision powered outpatient-department (OPD) queue manager for a small
@@ -101,11 +101,15 @@ state was trapped per-browser in `localStorage`.
   `waiting → called → in → done` (+ skipped/no-show), priority ordering,
   occupant-linked camera admissions (never backwards), manual/simulated
   overrides, adaptive wait-time model.
-* **Wait-time model** — starts from an 8-minute prior, ramps to the rolling
-  median of the last 12 *measured* consultations (full trust after 4); patient
-  ETA = remainder of current consultation + (people ahead × average), shown as
-  a range (−25 %/+30 %). Durations enter the model multiplied by TIME_SCALE
-  (60 for clips, 1 for webcam) so short demo videos produce realistic minutes.
+* **Wait-time model — fuzzy logic** — the learned average (an 8-minute prior blended into
+  the rolling median of the last 12 measurements, full trust after 4) plus the measurement
+  spread, the queue position and the progress of the live consultation feed a small Mamdani
+  fuzzy inference system (`app/fuzzy.py`, pure Python, no dependencies). It defuzzifies to a
+  wait range with a confidence tag; the patient screen also shows a linguistic label
+  ("almost your turn", "a few minutes", "about 15–35 min"…). Durations are stored in raw
+  clip seconds and converted to clinic minutes by the **demo time factor** (default ×25,
+  live slider on the nurse desk, ×1 for webcam), so 10–15 s of clip ≈ 4–6 clinic minutes and
+  sliding the factor re-scales every stored measurement instantly.
 * **Persistence** — `app/store.py`: atomic JSON writes to `data/state.json`
   every 2 s; corrupt files self-heal instead of crashing.
 
