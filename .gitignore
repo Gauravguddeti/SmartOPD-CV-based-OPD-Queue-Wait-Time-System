@@ -21,3 +21,10 @@ models/*.pt
 # OS noise
 Thumbs.db
 .DS_Store
+
+# LaTeX build byproducts (paper/main.pdf is committed)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+.tex/

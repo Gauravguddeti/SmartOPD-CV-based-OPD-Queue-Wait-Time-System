@@ -1,0 +1,652 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\graphicspath{{figures/}}
+
+% ---- TODO: replace the affiliation block with your institution ------------
+\author{
+\IEEEauthorblockN{Gaurav Guddeti and Aishwarya Zinjurtee}
+\IEEEauthorblockA{Department of Computer Science and Engineering\\
+Institution Name, City, India\\
+\{gaurav.guddeti, aishwarya.zinjurtee\}@example.edu}
+}
+
+\begin{document}
+
+\title{SmartOPD: Occupant-Aware Computer Vision and Fuzzy Wait-Time Estimation for Outpatient Queue Management}
+
+\maketitle
+
+\begin{abstract}
+Outpatient departments (OPDs) in small hospitals typically issue paper
+tokens, announce them by voice, and offer no reliable wait estimate, which
+drives crowding around the reception desk. This paper presents SmartOPD, an
+end-to-end, privacy-preserving system that couples a commodity camera to a
+live digital queue. A YOLO11n detector and a lightweight centroid tracker run
+server-side on CPU and convert people into \emph{occupants} of a doctor-room
+zone: an entry is only confirmed after a dwell period, people already inside
+when tracking starts become token-less \emph{ghosts}, and exits are matched
+per occupant so that a patient leaving never completes somebody else's
+consultation. Measured consultation lengths feed an adaptive prior-to-median
+estimator whose output is refined by a Mamdani fuzzy inference layer that
+reasons over consultation length, measurement confidence, spread, queue
+position and the progress of the live consultation, returning a wait range
+with a confidence tag and a linguistic label. Because demonstration clips
+compress time, durations are stored in raw video seconds and converted to
+clinic minutes by an operator-tunable factor. Three browser interfaces
+(monitoring console, nurse desk, patient display) share one FastAPI state
+store. The implementation ships with 58 unit tests and a headless replay
+harness that reproduces six complete consultations in order over a
+frame-continuous ping-pong clip, with no token ever moving backwards and
+every consultation training the estimator.
+\end{abstract}
+
+\begin{IEEEkeywords}
+computer vision, person detection, multi-object tracking, outpatient
+department, queue management, fuzzy logic, wait-time prediction, edge
+inference
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Queueing is the dominant experience of an outpatient department (OPD). A
+patient receives a paper token, sits in a hall, and depends on a nurse to
+call numbers by voice. Two failures follow: patients cannot plan their time,
+so they cluster around the desk to ask for updates, and the clinic has no
+measurement of how long consultations actually take, so any estimate it
+offers is a guess. Operations-research work on outpatient scheduling has long
+shown that appointment rules and queue discipline materially affect waiting
+and idleness \cite{cayirli2003,gupta2008}, yet these models assume that
+service times are known or estimated from historical records.
+
+Cameras already exist in most clinics, and modern single-stage detectors make
+person detection inexpensive on commodity hardware \cite{redmon2016yolo,
+redmon2018yolov3,ultralytics2024}. The gap addressed here is not detection
+accuracy but \emph{semantics}: converting anonymous detections into queue
+events that a hospital can trust, and converting noisy measurements into a
+wait estimate a patient can act on.
+
+This paper makes four contributions.
+\begin{enumerate}
+\item An \emph{occupant-based} room model that links a queue token to a
+tracked person only after a dwell-confirmed entry, distinguishes ghost
+occupants from admitted patients, and completes consultations per occupant so
+that simultaneous entry and exit (a swap at the door) never corrupts the
+queue.
+\item Seam handling for looped video sources: a frame-continuous ping-pong
+construction allows tracker identity and consultations to survive the wrap,
+while jump-cut sources freeze events and re-bind occupants after the cut.
+\item A fuzzy wait-time estimator that replaces the brittle
+``remainder plus people-ahead times average'' formula with a Mamdani
+inference system over five linguistic inputs, producing a range, a confidence
+tag and a patient-facing phrase.
+\item A reproducible implementation: three shared-state web interfaces, 58
+unit tests, and a headless replay harness that asserts ordering and
+no-backwards invariants on a real clip.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Person detection and tracking}
+Single-stage detectors such as YOLO regress boxes and class scores in one
+pass and are the de-facto choice for real-time person detection
+\cite{redmon2016yolo,redmon2018yolov3}; the YOLO11 family provides small
+weights that run on CPU \cite{ultralytics2024}. Tracking is dominated by
+detection-based association: SORT \cite{bewley2016sort} matches boxes with a
+Kalman filter and Hungarian assignment, DeepSORT \cite{wojke2017deepsort} adds
+an appearance embedding, and ByteTrack \cite{zhang2022bytetrack} associates
+low-confidence boxes as well. For a single fixed camera observing a waiting
+room, greedy nearest-neighbour association is sufficient and avoids an
+appearance model, at the cost of identity switches under long occlusions.
+
+\subsection{Crowd analytics in clinical spaces}
+CNN-based crowd counting and density estimation are mature
+\cite{sindagi2018}, but the literature largely reports head-count accuracy on
+public benchmarks. Clinical queue management additionally needs \emph{door
+events} (who entered, who left) and a mapping from events to named tokens,
+which is where the occupant model of Section~\ref{sec:vision} contributes.
+
+\subsection{Outpatient scheduling and queueing}
+Reviews of outpatient scheduling \cite{cayirli2003,gupta2008} optimise
+appointment intervals, panel sizes and overbooking under stochastic service
+times; classical queueing theory \cite{gross2018} supplies the wait
+expressions that our crisp baseline approximates. These models assume service
+time distributions are known; SmartOPD measures them from the camera and
+feeds them back, which closes the loop between operations research and
+computer vision.
+
+\subsection{Fuzzy decision support}
+Fuzzy sets \cite{zadeh1965fuzzy} and Mamdani inference \cite{mamdani1975}
+remain attractive when inputs are imprecise and stakeholders need
+interpretable rules \cite{ross2010fuzzy}. Waiting-time communication is
+exactly such a setting: ``about ten minutes, medium confidence'' is more
+honest than a false-precision single number.
+
+\section{System Architecture}
+\label{sec:arch}
+
+Fig.~\ref{fig:arch} shows the architecture. A single Python process serves
+both the vision pipeline and the web application. A background worker thread
+reads frames, runs detection and tracking, and updates the queue engine; the
+FastAPI layer \cite{fastapi2024} exposes JSON endpoints and three pages. State
+is persisted atomically to a local JSON file every two seconds, so a crash
+cannot corrupt the queue. Frames exist only in memory; only anonymous
+counters, tokens and durations are stored. No cloud service is contacted after
+installation.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_architecture.pdf}
+\caption{System architecture. One server process hosts the vision worker
+(YOLO11n $\rightarrow$ centroid tracker $\rightarrow$ zone analyzer), the
+queue engine with the fuzzy estimator, and the HTTP layer that feeds three
+browser interfaces. The annotated JPEG stream drives the monitoring console;
+all screens poll \texttt{/api/state}.}
+\label{fig:arch}
+\end{figure*}
+
+\begin{table}[t]
+\caption{The three interfaces and their users}
+\label{tab:ui}
+\centering
+\small
+\begin{tabular}{@{}p{1.3cm}p{1.3cm}p{3.9cm}@{}}
+\toprule
+Interface & User & Function \\
+\midrule
+Monitoring console & operator & live annotated feed, zone drawing,
+crowd counters, reason-coded event log \\
+Nurse desk & nurse & registration, token issue, call/skip/no-show, undo,
+time-factor slider, CSV export \\
+Patient display & waiting patients & now-serving board, next-up token,
+per-token wait range and confidence \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Vision Pipeline}
+\label{sec:vision}
+
+\subsection{Detection}
+Every processed frame is resized to 640\,px and passed to YOLO11n restricted
+to the \texttt{person} class at a confidence threshold of 0.35
+\cite{ultralytics2024}. On commodity CPU hardware the pipeline sustains
+10--16 processed frames per second, which is ample for room-level queue
+semantics; frames are deliberately not processed at the source rate.
+
+\subsection{Tracking}
+Detections are associated to existing tracks by greedy nearest-neighbour
+matching on the foot point $(c_x, c_y)$ of each box,
+\begin{equation}
+\hat{j} = \operatorname*{arg\,min}_{j:\ \lVert c_i-d_j\rVert_2 < d_{\max}}
+\lVert c_i-d_j\rVert_2 ,
+\end{equation}
+with $d_{\max}=0.18$ in normalized coordinates. A track survives
+$15$ consecutive misses ($\approx1.5$\,s) before it expires, which absorbs
+short occlusions; expiry is reported to the analyzer as a potential door
+event.
+
+\subsection{Occupant model}
+\label{sec:occupants}
+A token is a human artifact; a track is a machine artifact. The analyzer
+therefore maintains \emph{occupants},
+$\mathcal{O}=\{(k,\tau,t_{\mathrm{in}})\}$, where $k$ is a track key, $\tau$
+the linked token (or $\varnothing$) and $t_{\mathrm{in}}$ the time the person
+was first seen inside the doctor zone. Three rules make the mapping robust.
+
+\textbf{Entry requires a sighting outside and a dwell.} A track seen in the
+waiting area that moves inside the doctor zone is confirmed only after
+$\Delta_{\mathrm{entry}}=2$\,s of continuous presence, i.e.
+\begin{equation}
+\text{entry}(k) \iff t_{\mathrm{in}}\ \text{recorded} \ \wedge\
+(t_{\mathrm{now}}-t_{\mathrm{in}}) \ge \Delta_{\mathrm{entry}} .
+\end{equation}
+Shorter crossings are logged as pass-bys and touch no token. A track that is
+inside at tracking start (or after a seam) and was never seen outside becomes
+a \emph{ghost} occupant with $\tau=\varnothing$: it occupies the room but
+cannot consume a token.
+
+\textbf{Exit is per occupant.} An occupant leaves when its foot point stays
+outside the zone for four consecutive frames (single-frame flicker cannot end
+a consultation) or when its track vanishes at the door. Only the leaver's
+token is completed. In a swap---one patient walking out while another walks
+in---the two events are independent and the queue advances exactly once.
+
+\textbf{Tokens never move backwards.} The camera may transition a token
+$\text{waiting}\rightarrow\text{called}\rightarrow\text{in}\rightarrow
+\text{done}$ only. Earlier prototypes reverted an admission when a stay looked
+too short; on short demonstration clips that rule oscillated between states
+and is removed. Noise protection now happens strictly before admission.
+
+\subsection{Seams and continuous loops}
+\label{sec:seam}
+Demonstration clips are seconds long while consultations are minutes long. Two
+mechanisms bridge the gap. First, a \emph{ping-pong} source is generated by
+concatenating the clip with its reverse; every join and the wrap are
+frame-continuous, so the tracker is \emph{not} reset and a consultation may
+span several loops. Second, ordinary (jump-cut) sources trigger a
+\emph{seam}: events are frozen for $\Delta_{\mathrm{hold}}=1.5$\,s, the
+tracker is reset, and occupants are re-bound to the people the camera then
+sees (Algorithm~\ref{alg:rebind}).
+
+\begin{algorithm}[t]
+\caption{Seam re-binding of occupants}
+\label{alg:rebind}
+\begin{algorithmic}[1]
+\State freeze entry/exit events for $\Delta_{\mathrm{hold}}$
+\State reset tracker (all track keys die; occupants survive)
+\State \textbf{after} the hold, take the set $I$ of track keys inside the zone
+\State order occupants $\mathcal{O}$: token-bearing first, then by $t_{\mathrm{in}}$
+\For{$i \leftarrow 1$ \textbf{to} $\min(|I|,|\mathcal{O}|)$}
+  \State re-key $\mathcal{O}_i$ to $I_i$; reset its miss counter
+\EndFor
+\State every remaining key in $I$ becomes a new ghost occupant
+\State occupants without a visible track are \emph{kept} (never guessed away)
+\State log \textsc{rebound} with counts (re-bound, new ghosts, kept)
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Crowd analytics}
+Two counters are derived per frame: \emph{in frame} (all live tracks) and
+\emph{in waiting area} (stable tracks, i.e.\ at least two hits, whose foot
+point lies in the waiting zone \emph{and not} in the doctor zone). Excluding
+the doctor zone is what makes the public number fall when a patient is
+admitted instead of counting the same person twice.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{annotated_frame.jpg}
+\caption{Annotated frame produced by the server. Waiting and doctor zones are
+tinted; each person carries a track id and, inside the doctor zone, its
+occupant tag (a token number or \texttt{ghost}). A CCTV-style label,
+timestamp and recording dot make the stream readable on a wall display.}
+\label{fig:frame}
+\end{figure}
+
+\section{Queue Semantics}
+\label{sec:queue}
+
+A token moves through
+$\{\text{waiting},\text{called},\text{in},\text{done}\}$ with
+$\{\text{skipped},\text{noshow}\}$ reachable from waiting/called and
+re-queueable. When an entry is confirmed, the engine links a token in a fixed
+priority order: (i) a token the nurse already \emph{called}; (ii) otherwise,
+if the camera-advance mode is enabled (default), the next waiting token by
+priority flag and registration order; (iii) otherwise the occupant is
+recorded as unlinked. The nurse can always override with manual enter/free,
+skip, no-show, re-queue, and an \emph{undo} that returns the most recent
+completed token to the queue and removes the corresponding measurement.
+
+Every transition is written to an event log with a reason code
+(\textsc{entry\_confirmed}, \textsc{pass\_by}, \textsc{exit\_linked},
+\textsc{exit\_ghost}, \textsc{seam\_hold}, \textsc{rebound}) and a source
+(\texttt{camera}, \texttt{nurse}, \texttt{manual}, \texttt{simulation}). The
+code makes the system auditable: an operator can distinguish ``the camera
+admitted a patient'' from ``the nurse corrected a mistake''.
+
+\section{Fuzzy Wait-Time Estimation}
+\label{sec:fuzzy}
+
+\subsection{Learned consultation length}
+Let $t^{(1)},\dots,t^{(n)}$ be the raw durations of the last
+$W=12$ consultations, measured in video seconds. They are converted to clinic
+minutes by the factor $\kappa$ (default $\kappa=25$; $\kappa=1$ for a live
+webcam) and blended with an 8-minute prior $P$,
+\begin{equation}
+\hat{m} = (1-w)\,P + w\,\operatorname{median}_{i\le W}\!\left(\frac{\kappa\,t^{(i)}}{60}\right),
+\end{equation}
+with blending weight $w=\min(1,n/4)$. Storing raw seconds (rather than pre-scaled minutes) means the operator can
+slide $\kappa\in[10,120]$ and every historical measurement is re-scaled
+consistently, including ETA bounds already on screen.
+
+\subsection{Membership functions}
+Five inputs are fuzzified with triangular and trapezoidal sets
+(Fig.~\ref{fig:sets}): consultation length (short/medium/long), measurement
+confidence from $n$ (low/medium/high), spread via the coefficient of
+variation (tight/moderate/wide), queue position (none/few/many) and progress
+$p=(t_{\mathrm{now}}-t_{\mathrm{in}})/\bar{t}$ of the live consultation
+(just started / mid / likely ending).
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{fig_fuzzy_sets.pdf}
+\caption{Membership functions of the fuzzy estimator. (a) The learned
+consultation length is partitioned into short, medium and long sets.
+(b) The defuzzified wait is expressed over tiny, small, medium, large and
+huge output sets.}
+\label{fig:sets}
+\end{figure*}
+
+\subsection{Rule base and defuzzification}
+Table~\ref{tab:rules} lists the rule base. Rule strength uses the minimum of
+antecedents, rules are aggregated by maximum, and the output is defuzzified by
+the centroid method over a discretized universe
+$X=\{0,0.5,\dots,120\}$ clinic minutes,
+\begin{equation}
+y^{*} = \frac{\sum_{x\in X} x\,\mu(x)}{\sum_{x\in X}\mu(x)},
+\qquad
+\mu(x)=\max_{r}\min\!\big(\alpha_r,\mu_{C_r}(x)\big).
+\end{equation}
+The bounds are derived from the same fuzzy state rather than a fixed
+percentage,
+\begin{equation}
+s = 0.18 + 0.32\,\mu_{\mathrm{wide}} + 0.22\,(1-\mu_{\mathrm{high}}),
+\end{equation}
+\begin{equation}
+[y^{-},y^{+}] = \big[y^{*}(1-s),\ y^{*}(1+1.15\,s)\big],
+\end{equation}
+so sparse or erratic measurements widen the interval instead of pretending
+precision. A consultation that has already overrun its average activates
+``ending'', which pulls the first waiting patient towards
+\emph{almost your turn}. Fig.~\ref{fig:curve} shows the resulting surface: the
+wait grows with queue position and with the learned length, with the highest
+sensitivity for long consultations.
+
+\begin{table}[t]
+\caption{Fuzzy rule base (antecedent $\rightarrow$ consequent)}
+\label{tab:rules}
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Antecedent & Consequent \\
+\midrule
+length short $\wedge$ ahead none & wait tiny \\
+length short $\wedge$ ahead few & wait small \\
+length short $\wedge$ ahead many & wait medium \\
+length medium $\wedge$ ahead none & wait small \\
+length medium $\wedge$ ahead few & wait medium \\
+length medium $\wedge$ ahead many & wait large \\
+length long $\wedge$ ahead none & wait medium \\
+length long $\wedge$ ahead few & wait large \\
+length long $\wedge$ ahead many & wait huge \\
+progress ending $\wedge$ ahead none & wait tiny \\
+confidence low & wait medium (weight 0.6) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\columnwidth]{fig_fuzzy_curve.pdf}
+\caption{Defuzzified wait versus queue position for three learned
+consultation lengths (8 samples, moderate spread, consultation at 30\,\% of
+its expected length).}
+\label{fig:curve}
+\end{figure}
+
+\subsection{Presentation}
+Each waiting token is exposed as a range, a confidence tag and a phrase.
+The nurse sees e.g.\ ``5--19 min, low confidence''; the patient display shows
+``about 5--18 min'' together with the expected clock time and the number of
+patients ahead. The phrase is deliberately qualitative where the model is
+uncertain, which we consider a feature rather than a limitation.
+
+\section{Interfaces}
+\label{sec:ui}
+
+All three pages poll \texttt{/api/state} once per second, so any screen can run
+on any device on the local network.
+
+\textbf{Monitoring console} (Fig.~\ref{fig:monitor}) shows the annotated feed,
+the two crowd counters, the occupant list of the doctor room and the
+reason-coded event log, and offers zone drawing (persisted per clip), a
+conservative auto-detect that only proposes a door near a frame edge, manual
+fallback buttons and a simulation for camera-less dry runs.
+
+\textbf{Nurse desk} (Fig.~\ref{fig:nurse}) is the operational surface:
+registration with priority flag, the live queue with a NEXT marker, call /
+skip / no-show / re-queue, undo of the last consultation, CSV export, the
+camera-advance toggle and the demo time-factor slider with live re-scaling.
+
+\textbf{Patient display} (Fig.~\ref{fig:patient}) is a kiosk board: now
+serving, next up (flashing ``please proceed'' when called), waiting count, and
+a per-token lookup giving patients ahead, a range, a phrase, the expected
+clock time and the number of consultations the estimate is based on.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.88\columnwidth]{monitor.png}
+\caption{Monitoring console: annotated CCTV feed with zones and occupant
+tags, live crowd counters, room occupants, and the reason-coded event log.}
+\label{fig:monitor}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.88\columnwidth]{nurse.png}
+\caption{Nurse desk: queue with NEXT marker, fuzzy wait ranges with confidence
+tags, doctor-room occupants, completed consultations with undo, and the demo
+time-factor slider.}
+\label{fig:nurse}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.88\columnwidth]{patient.png}
+\caption{Patient display: now-serving / next-up / waiting board and a per-token
+estimate with a linguistic label and confidence.}
+\label{fig:patient}
+\end{figure}
+
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Unit tests}
+The suite contains 58 tests (Table~\ref{tab:tests}) and runs in under a
+second on CPU. Vision tests drive an injected clock, so time-based rules are
+tested deterministically rather than by sleeping. Property-style tests assert
+that more people ahead never shorten a wait and that sparse data never
+narrows the bounds, which protects the estimator against future refactoring.
+
+\begin{table}[t]
+\caption{Test suites and what they pin down}
+\label{tab:tests}
+\centering
+\small
+\begin{tabular}{@{}lcp{4.3cm}@{}}
+\toprule
+File & \# & Coverage \\
+\midrule
+\texttt{test\_queue.py} & 31 & token lifecycle, priority order, occupant
+admission, swap safety, ghost exits, never-backwards invariant, undo,
+serialisation and migration, CSV \\
+\texttt{test\_vision.py} & 17 & tracker identity and expiry, entry dwell,
+pass-by, flicker, vanish exits, seam hold and re-binding, continuous-loop
+identity, crowd counting \\
+\texttt{test\_fuzzy.py} & 10 & monotonicity in queue position and length,
+progress sensitivity, confidence widening, prior fallback, label buckets \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Headless replay}
+A replay harness (\texttt{scripts/replay\_check.py}) runs the real detector,
+tracker, analyzer and engine over the ping-pong clip for three loops with six
+tokens waiting, using video time as the engine clock. It asserts that all six
+tokens complete, that completions occur in registration order, that no token
+ever moves from \texttt{in} back to \texttt{called}/\texttt{waiting}, and that
+every completed consultation trains the estimator.
+
+\begin{table}[t]
+\caption{Replay results (six tokens, ping-pong clip, $\kappa=25$)}
+\label{tab:replay}
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Token & Status & Raw $t$ (s) & Clinic (min) & Learned \\
+\midrule
+\#1 & done & 11.0 & 4.6 & yes \\
+\#2 & done & 4.6  & 1.9 & yes \\
+\#3 & done & 11.0 & 4.6 & yes \\
+\#4 & done & 4.6  & 1.9 & yes \\
+\#5 & done & 11.0 & 4.6 & yes \\
+\#6 & done & 4.6  & 1.9 & yes \\
+\midrule
+\multicolumn{2}{@{}l}{completed / learned} & \multicolumn{3}{l}{6/6 \quad 6/6} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The alternating durations are a property of the clip geometry: the room is
+entered from one side and left from the other, so the forward and reverse
+halves alternate long and short stays. This is exactly the case that broke
+the earlier ``short stay implies revert'' rule; under the current semantics
+both durations are legitimate consultations and the queue advances on each
+exit (Table~\ref{tab:replay}). The replay also demonstrates the intended
+invariances: the woman who is already inside at $t=0$ is admitted as a ghost
+and her exit is logged \textsc{exit\_ghost} without touching a token, while the
+man who walks in consumes token~\#1.
+
+\subsection{Live operation}
+On the demo clip the server reports 15--19 persons in frame at 10--16
+processed FPS on CPU, with two occupants inside the doctor zone during a swap.
+After a single measured consultation the estimator shows the expected
+behaviour of a low-confidence state: wide ranges (e.g.\ 5--19, 3--21 and
+4--23 minutes for successive queue positions) tagged \emph{low confidence}.
+Moving the factor from $\times25$ to $\times120$ re-scales the same
+measurements immediately, which operators use to match the pace of a staged
+demonstration.
+
+\subsection{What is \emph{not} measured}
+We deliberately do not report precision/recall for door events or mean
+absolute error for ETAs: the project has no frame-level ground truth
+annotation, and inventing one from the same detector would be circular. A
+proper field study needs a hand-labelled subset of entry/exit events
+($F_1$, latency) and a log of realised consultation times (MAE, coverage of
+the predicted interval). Section~\ref{sec:limits} lists this as the primary
+next step.
+
+\section{Limitations and Ethical Considerations}
+\label{sec:limits}
+
+\textbf{Identity.} The camera does not know who a person is. The system
+assumes queue order: the person who walks in is the next token. This is
+acceptable for a single-server OPD, but a patient who jumps the queue will
+consume somebody else's token, and the nurse must correct it with undo. Person
+re-identification \cite{zheng2016reid} would be required to verify identity
+and is left as future work.
+
+\textbf{Single room.} One doctor zone, one active queue. Multi-room operation
+requires per-zone occupants and per-room queues.
+
+\textbf{Visibility.} The patient must remain visible inside the zone while
+consulting; if the room is fully out of view, the nurse falls back to manual
+enter/free. Occlusion at the door can delay an exit by up to the miss budget.
+
+\textbf{Short clips and time scaling.} The $\kappa$ factor is a calibration,
+not a measurement. It is exposed, logged and changeable at runtime precisely
+because no single value is ``correct'' for a staged video.
+
+\textbf{Privacy.} Frames are processed in memory and never written to disk or
+transmitted; only anonymous counters, token numbers, durations and zone
+rectangles persist locally. A deployed system would still require signage and
+institutional approval, and should blur faces at the capture stage.
+
+\section{Conclusion and Future Work}
+
+SmartOPD shows that an inexpensive camera plus a disciplined event model can
+turn an OPD waiting hall into a measurable queue: entries and exits are
+attributed per person, tokens advance without nurse input, and the wait
+estimate becomes a range with an honest confidence tag instead of a false
+single number. The implementation is small, offline, auditable and covered by
+58 tests plus a replay harness.
+
+Future work follows directly from the limitations: (i) a field study with
+annotated door events and realised consultation times to quantify $F_1$ and
+ETA error; (ii) person re-identification at the door to verify the admitted
+patient; (iii) multi-room and multi-camera operation; (iv) patient-side QR
+check-in so registration and queue state share one identifier; and (v)
+integration with hospital information systems, for which the CSV export is the
+current hand-off point.
+
+\section*{Reproducibility}
+The implementation, tests, replay harness and demo assets are released under
+the MIT licence.\footnote{Source:
+\url{https://github.com/Gauravguddeti/SmartOPD-CV-based-OPD-Queue-Wait-Time-System}}
+The pipeline runs offline after a one-command setup that installs a local
+Python environment and a 6\,MB detector weight file.
+
+\begin{thebibliography}{16}
+
+\bibitem{cayirli2003}
+T.~Cayirli and E.~Veral, ``Outpatient scheduling in health care: A review of
+literature,'' \emph{Production and Operations Management}, vol.~12, no.~4,
+pp. 519--549, 2003.
+
+\bibitem{gupta2008}
+D.~Gupta and B.~Denton, ``Appointment scheduling in health care: Challenges and
+opportunities,'' \emph{IIE Transactions}, vol.~40, no.~9, pp. 800--819, 2008.
+
+\bibitem{redmon2016yolo}
+J.~Redmon, S.~Divvala, R.~Girshick, and A.~Farhadi, ``You only look once:
+Unified, real-time object detection,'' in \emph{Proc. IEEE Conf. Computer
+Vision and Pattern Recognition (CVPR)}, 2016, pp. 779--788.
+
+\bibitem{redmon2018yolov3}
+J.~Redmon and A.~Farhadi, ``YOLOv3: An incremental improvement,''
+\emph{arXiv preprint arXiv:1804.02767}, 2018.
+
+\bibitem{ultralytics2024}
+Ultralytics, ``YOLO11: Ultralytics YOLO documentation,'' 2024. [Online].
+Available: \url{https://docs.ultralytics.com/models/yolo11/}
+
+\bibitem{bewley2016sort}
+A.~Bewley, Z.~Ge, L.~Ott, F.~Ramos, and B.~Upcroft, ``Simple online and
+realtime tracking,'' in \emph{Proc. IEEE Int. Conf. Image Processing (ICIP)},
+2016, pp. 3464--3468.
+
+\bibitem{wojke2017deepsort}
+N.~Wojke, A.~Bewley, and D.~Paulus, ``Simple online and realtime tracking with
+a deep association metric,'' in \emph{Proc. IEEE Int. Conf. Image Processing
+(ICIP)}, 2017, pp. 3645--3649.
+
+\bibitem{zhang2022bytetrack}
+Y.~Zhang \emph{et al.}, ``ByteTrack: Multi-object tracking by associating every
+detection box,'' in \emph{Proc. European Conf. Computer Vision (ECCV)}, 2022,
+pp. 1--21.
+
+\bibitem{sindagi2018}
+V.~A. Sindagi and V.~M. Patel, ``A survey of recent advances in CNN-based
+single image crowd counting and density estimation,'' \emph{Pattern
+Recognition Letters}, vol.~107, pp. 3--16, 2018.
+
+\bibitem{gross2018}
+D.~Gross, J.~F. Shortle, J.~M. Thompson, and C.~M. Harris, \emph{Fundamentals
+of Queueing Theory}, 5th~ed. Hoboken, NJ, USA: Wiley, 2018.
+
+\bibitem{zadeh1965fuzzy}
+L.~A. Zadeh, ``Fuzzy sets,'' \emph{Information and Control}, vol.~8, no.~3,
+pp. 338--353, 1965.
+
+\bibitem{mamdani1975}
+E.~H. Mamdani and S.~Assilian, ``An experiment in linguistic synthesis with a
+fuzzy logic controller,'' \emph{International Journal of Man-Machine Studies},
+vol.~7, no.~1, pp. 1--13, 1975.
+
+\bibitem{ross2010fuzzy}
+T.~J. Ross, \emph{Fuzzy Logic with Engineering Applications}, 3rd~ed.
+Chichester, U.K.: Wiley, 2010.
+
+\bibitem{zheng2016reid}
+L.~Zheng, Y.~Yang, and A.~G. Hauptmann, ``Person re-identification: Past,
+present and future,'' \emph{arXiv preprint arXiv:1610.02984}, 2016.
+
+\bibitem{fastapi2024}
+S.~Ram\'irez, ``FastAPI documentation,'' 2024. [Online]. Available:
+\url{https://fastapi.tiangolo.com}
+
+\end{thebibliography}
+
+\end{document}
